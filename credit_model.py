@@ -30,14 +30,6 @@ def dfun(r0):
     """Loan demand function D(r)."""
     return 1.0 / r0
 
-def gpriorfun(om):
-    """Prior density of good borrowers (uniform on [0,1])."""
-    return np.ones_like(np.atleast_1d(om)).astype(float) if not np.isscalar(om) else 1.0
-
-def bpriorfun(om, BperG):
-    """Prior density of bad borrowers (uniform, scaled by BperG)."""
-    return BperG * np.ones_like(np.atleast_1d(om)).astype(float) if not np.isscalar(om) else BperG
-
 # =============================================================================
 # PARAMETERS
 # =============================================================================
@@ -50,6 +42,34 @@ class Parameters:
     BperG: float = 0.2    # Ratio of bad to good borrowers
     Delta: float = 0.001  # Step size for alpha iteration
     delom: float = 0.0001 # Step size for omega grid
+    # Prior shape parameters (0 = uniform)
+    # g(omega) = (1+a_g) * omega^a_g    -- integrates to 1 on [0,1]
+    # b(omega) = BperG * (1+a_b) * (1-omega)^a_b  -- integrates to BperG on [0,1]
+    a_g: float = 0.05
+    a_b: float = 0.05
+
+# Global reference to current parameters (for prior functions)
+_current_params = Parameters()
+
+def gpriorfun(om):
+    """Prior density of good borrowers: g(omega) = (1+a_g) * omega^a_g."""
+    a_g = _current_params.a_g
+    om_arr = np.atleast_1d(np.asarray(om, dtype=float))
+    if a_g == 0:
+        result = np.ones_like(om_arr)
+    else:
+        result = (1 + a_g) * np.power(np.maximum(om_arr, 0.0), a_g)
+    return result if result.size > 1 else float(result[0])
+
+def bpriorfun(om, BperG):
+    """Prior density of bad borrowers: b(omega) = BperG * (1+a_b) * (1-omega)^a_b."""
+    a_b = _current_params.a_b
+    om_arr = np.atleast_1d(np.asarray(om, dtype=float))
+    if a_b == 0:
+        result = BperG * np.ones_like(om_arr)
+    else:
+        result = BperG * (1 + a_b) * np.power(np.maximum(1.0 - om_arr, 0.0), a_b)
+    return result if result.size > 1 else float(result[0])
 
 # =============================================================================
 # HELPER FUNCTIONS
@@ -80,12 +100,14 @@ def NSfun(al, beta, badleftover, Pi, BperG):
 def solve_nested(params):
     """
     Solve the model under nested information structure.
-    
+
     Returns equilibrium with three regions:
     - Region I: alpha in [alpha0, alpha1], flat rate rp
     - Region II: alpha in [alpha1, alpha2], rate r(alpha) = c(alpha) + Pi
     - Region III: non-selective lenders (alpha=0) at rate r_NS
     """
+    global _current_params
+    _current_params = params
     Pi, beta, BperG = params.Pi, params.beta, params.BperG
     Delta, delom = params.Delta, params.delom
     
@@ -257,20 +279,25 @@ def solve_nested_analytical(params):
     """
     Solve the nested model using the closed-form analytical solution for Region I.
 
-    Key insight: under uniform priors, the nested pool structure implies that
-    bad borrowers in the acceptance region are uniformly depleted, while good
-    borrowers at the threshold are undepleted (own-slice). Combined with the
-    equal-profit condition gamma(alpha) = Gamma(alpha), this pins down B(alpha)
-    algebraically:
+    Works for general (non-uniform) priors. Two structural lemmas hold for ANY prior:
+    1. Good borrowers at threshold omega_g(alpha) are undepleted (own-slice)
+    2. Bad borrowers in [omega_b(alpha), 1] are uniformly depleted by factor E(alpha)
 
-        B(alpha) = (1-beta)*g_bar*(1-Gamma)^2*(1-alpha) / [Gamma'*(1-alpha) - Gamma*(1-Gamma)]
+    Combined with the equal-profit condition gamma = Gamma(alpha), this pins down
+    T(alpha) algebraically via three prior-dependent known functions:
+        g_tilde(alpha) = gpriorfun(omega_g(alpha))  -- good density at threshold
+        b_tilde(alpha) = bpriorfun(omega_b(alpha))  -- bad density at threshold
+        B0_tilde(alpha) = int_{omega_b(alpha)}^1 bpriorfun(omega) domega  -- prior bad mass
 
-    where Gamma(alpha) = (1+K(alpha))/(1+rp), Gamma' = C'(alpha)/(1+rp).
+    The general formula:
+        T = (1-beta)*g_tilde*(1-Gamma)*B0_tilde / [Gamma'*B0_tilde - beta*b_tilde*Gamma*(1-Gamma)]
 
+    Under uniform priors (g=1, b=BperG), this reduces to the original formula.
     No discretization of omega is needed. Only alpha is gridded (finely).
     """
+    global _current_params
+    _current_params = params
     Pi, beta, BperG = params.Pi, params.beta, params.BperG
-    g_bar, b_bar = 1.0, BperG
 
     # =========================================================================
     # Find alpha0 and rp (same as solve_nested)
@@ -299,62 +326,68 @@ def solve_nested_analytical(params):
     alphas = np.linspace(alpha0, alpha1, n_R1)
     da = alphas[1] - alphas[0] if n_R1 > 1 else 1e-6
 
+    # Thresholds
+    omega_g_vals = beta + alphas * (1 - beta)
+    omega_b_vals = 1 - beta + alphas * beta
+
+    # Prior-dependent inputs at each alpha (general priors)
+    g_tilde = np.array([gpriorfun(og) for og in omega_g_vals])
+    b_tilde = np.array([bpriorfun(ob, BperG) for ob in omega_b_vals])
+    B0_tilde = np.array([quad(lambda x: bpriorfun(x, BperG), ob, 1)[0]
+                         for ob in omega_b_vals])
+
     # Precompute Gamma(alpha) and Gamma'(alpha)
     K_vals = cfun(alphas) + Pi
     Gamma = (1 + K_vals) / (1 + rp)
     Gamma_p = cfun_prime_exact(alphas) / (1 + rp)
 
-    # Analytical B(alpha)
     one_minus_Gamma = 1 - Gamma
-    denom = Gamma_p * (1 - alphas) - Gamma * one_minus_Gamma
-    # Guard against division by zero near alpha1 where denom -> 0
+
+    # General T formula
+    denom = Gamma_p * B0_tilde - beta * b_tilde * Gamma * one_minus_Gamma
     denom_safe = np.where(np.abs(denom) < 1e-15, 1e-15, denom)
-    B_vals = (1 - beta) * g_bar * one_minus_Gamma**2 * (1 - alphas) / denom_safe
+    T_vals = (1 - beta) * g_tilde * one_minus_Gamma * B0_tilde / denom_safe
 
     # Derived quantities
-    T_vals = B_vals / np.where(np.abs(one_minus_Gamma) < 1e-15, 1e-15, one_minus_Gamma)
     G_vals = Gamma * T_vals
+    B_vals = one_minus_Gamma * T_vals
     gamma_vals = np.where(T_vals > 1e-15, G_vals / T_vals, 1.0)
 
-    # E(alpha) = exp(-Theta) = B / (b_bar * beta * (1-alpha))
-    E_vals = B_vals / np.where(
-        np.abs(b_bar * beta * (1 - alphas)) < 1e-15, 1e-15,
-        b_bar * beta * (1 - alphas))
+    # Depletion factor E(alpha) = B(alpha) / B0_tilde(alpha)
+    E_vals = B_vals / np.where(np.abs(B0_tilde) < 1e-15, 1e-15, B0_tilde)
 
-    # theta(alpha) from the continuous ODE: dB/da = -beta*b_bar*E - theta*B
-    # Since E = B/(beta*b_bar*(1-a)), this gives theta = -d(ln B)/da - 1/(1-a).
-    # Differentiating ln B = ln[(1-beta)*g_bar] + 2*ln(1-Gamma) + ln(1-a) - ln(denom):
-    #   theta = 2*Gamma'/(1-Gamma) + denom'/denom
-    # where denom' = Gamma''*(1-a) - 2*Gamma'*(1-Gamma).
-    #
-    # Equivalently, theta = [Gamma''*T + 2*Gamma'*Lambda_loc] / [(1-beta)*(1-Gamma)]
-    # where Lambda_loc = (1-beta)*g_bar - beta*b_bar*E.
-    Gamma_pp = cfun_prime2_exact(alphas) / (1 + rp)
-    Lambda_loc = (1 - beta) * g_bar - beta * b_bar * E_vals
-    one_minus_Gamma_safe = np.where(np.abs(one_minus_Gamma) < 1e-15, 1e-15, one_minus_Gamma)
-    theta_vals = (Gamma_pp * T_vals + 2 * Gamma_p * Lambda_loc) / ((1 - beta) * one_minus_Gamma_safe)
+    # theta(alpha) = -d(ln E)/dalpha, computed via numerical differentiation
+    ln_E = np.log(np.maximum(E_vals, 1e-30))
+    theta_vals = np.zeros_like(alphas)
+    # Central differences for interior points
+    theta_vals[1:-1] = -(ln_E[2:] - ln_E[:-2]) / (2 * da)
+    # One-sided at boundaries
+    theta_vals[0] = -(ln_E[1] - ln_E[0]) / da
+    theta_vals[-1] = -(ln_E[-1] - ln_E[-2]) / da
 
     # w(alpha) = theta * D(rp) * T
     w_vals = theta_vals * D_rp * T_vals
     w_vals = np.maximum(w_vals, 0)  # w can't be negative (ironing)
 
-    # Cumulative capital: W(alpha) = integral of w from alpha0 to alpha
-    W_cumsum = np.cumsum(w_vals) * da
+    # Cumulative capital: W(alpha_k) = integral of w from alpha0 to alpha_k
+    # Use left-endpoint Riemann sum so W(alpha_0) = 0
+    W_cumsum = np.zeros_like(alphas)
+    W_cumsum[1:] = np.cumsum(w_vals[:-1]) * da
 
     # Remaining good/bad borrowers (total, not just in acceptance region)
-    # For total remaining good: G(alpha) [in acceptance] + g_bar*(1-omega_g(alpha)) [outside]
-    omega_g_vals = beta + alphas * (1 - beta)
-    G_leftover = G_vals + g_bar * (1 - omega_g_vals)
+    # Good outside acceptance: integral of g from omega_g to 1
+    G_outside = np.array([quad(gpriorfun, og, 1)[0] for og in omega_g_vals])
+    G_leftover = G_vals + G_outside
 
-    # For total remaining bad: B(alpha) [in acceptance] + bad who dropped out
-    # Bad borrowers with omega < omega_b(alpha_0) were never in any acceptance
-    # region and are undepleted: mass = b_bar * omega_b(alpha_0).
-    # Bad borrowers with omega in [omega_b(alpha_0), omega_b(alpha)] dropped out
-    # at various skills and are partially depleted: mass = b_bar*beta * integral of E.
-    # Bad borrowers in [omega_b(alpha), 1] are still in acceptance: mass = B(alpha).
+    # Bad remaining: undepleted below omega_b(alpha_0) + depleted dropouts + B(alpha)
     omega_b_0 = 1 - beta + alpha0 * beta
-    E_integral = np.cumsum(E_vals) * da  # integral of E from alpha0 to alpha
-    B_leftover = b_bar * omega_b_0 + b_bar * beta * E_integral + B_vals
+    B_below_0 = quad(lambda x: bpriorfun(x, BperG), 0, omega_b_0)[0]
+    # Dropouts: bad borrowers at threshold omega_b(alpha') who left as alpha' increased
+    # Their density at dropout was b_tilde(alpha') * E(alpha'), width d(omega_b) = beta*da
+    b_tilde_E = b_tilde * E_vals * beta
+    B_dropouts = np.zeros_like(alphas)
+    B_dropouts[1:] = np.cumsum(b_tilde_E[:-1]) * da
+    B_leftover = B_below_0 + B_dropouts + B_vals
 
     # =========================================================================
     # State at end of Region I
@@ -382,26 +415,31 @@ def solve_nested_analytical(params):
     r_NS = cfun(alpha2) + Pi
 
     # =========================================================================
-    # Region II: alpha1 to alpha2 (same as solve_nested)
+    # Region II: alpha1 to alpha2 (general priors)
     # =========================================================================
     n_R2 = max(int((alpha2 - alpha1) * 100), 10)
     alphas_R2 = np.linspace(alpha1, alpha2, n_R2)
     da_R2 = alphas_R2[1] - alphas_R2[0] if n_R2 > 1 else 0.01
 
-    ws_R2 = np.array([dfun(cfun(al) + Pi) * (1 - beta) * g_bar for al in alphas_R2])
+    omega_g_R2 = beta + alphas_R2 * (1 - beta)
+    g_tilde_R2 = np.array([gpriorfun(og) for og in omega_g_R2])
+    ws_R2 = np.array([dfun(cfun(al) + Pi) * (1 - beta) * g_tilde_R2[i]
+                       for i, al in enumerate(alphas_R2)])
 
     G_remaining = G_end_R1
     GLOs_R2, BLOs_R2 = [], []
     for i, al in enumerate(alphas_R2):
         if i > 0:
-            G_remaining -= (1 - beta) * da_R2
+            G_remaining -= (1 - beta) * g_tilde_R2[i] * da_R2
         GLOs_R2.append(max(G_remaining, 0))
         BLOs_R2.append(badleftover)
 
     # =========================================================================
-    # Compute cumulative capital for Region II
+    # Compute cumulative capital for Region II (continuous from Region I)
     # =========================================================================
-    W_R2_cumsum = W_cumsum[-1] + np.cumsum(ws_R2) * da_R2
+    W_R2_cumsum = np.zeros(len(alphas_R2))
+    W_R2_cumsum[1:] = np.cumsum(ws_R2[:-1]) * da_R2
+    W_R2_cumsum += W_cumsum[-1]
 
     return {
         'alpha0': alpha0, 'alpha1': alpha1, 'alpha2': alpha2,
@@ -440,6 +478,8 @@ def solve_nested_analytical(params):
 
 def solve_iid(params):
     """Solve the model under IID information structure using scalar ODE."""
+    global _current_params
+    _current_params = params
     Pi, beta, BperG = params.Pi, params.beta, params.BperG
     
     z0 = 1 / (1 + BperG)
@@ -528,11 +568,11 @@ def solve_iid(params):
 # PLOTTING
 # =============================================================================
 
-def plot_comparison(params, nested, iid, nested_a=None):
-    """Create comparison plots for nested vs IID equilibria.
+def plot_comparison(params, nested, iid, nested_disc=None):
+    """Create comparison plots for nested (analytical) vs IID equilibria.
 
-    If nested_a (analytical solver result) is provided, its curves are
-    overlaid as green dashed lines on each panel for comparison.
+    If nested_disc (discrete solver result) is provided, its curves are
+    overlaid as dashed green lines for comparison.
     """
     fig, axes = plt.subplots(2, 2, figsize=(12, 10))
 
@@ -543,31 +583,32 @@ def plot_comparison(params, nested, iid, nested_a=None):
     r_NS = nested['r_NS']
     WNS = nested['WNS']
 
+    # Prior description for title
+    prior_desc = f"a_g={params.a_g}, a_b={params.a_b}"
+    if params.a_g == 0 and params.a_b == 0:
+        prior_desc = "uniform priors"
+
     # =========================================================================
     # Panel 1: Interest Rate r(alpha)
     # =========================================================================
-    # Region I: flat at rp
     alpha_r1 = np.linspace(alpha0, alpha1, 100)
     r_r1 = rp * np.ones_like(alpha_r1)
-    # Region II: r = c(alpha) + Pi
     alpha_r2 = np.linspace(alpha1, alpha2, 100)
     r_r2 = cfun(alpha_r2) + params.Pi
 
-    axes[0,0].plot(alpha_r1, r_r1, 'b-', lw=2, label='Nested (selective)')
+    axes[0,0].plot(alpha_r1, r_r1, 'b-', lw=2, label='Nested analytical')
     axes[0,0].plot(alpha_r2, r_r2, 'b-', lw=2)
-    # Region III: atom at alpha=0
     axes[0,0].plot(0, r_NS, 'bo', markersize=10, markerfacecolor='blue', label='Nested (non-selective)')
-    # IID
     axes[0,0].plot(iid['alpha_eq'], iid['r_eq'], 'r-', lw=2, label='IID')
 
-    # Analytical overlay: r(alpha) is identical (flat at rp in R1, c+Pi in R2)
-    if nested_a is not None:
-        a2_a = nested_a['alpha2']
-        alpha_r2_a = np.linspace(alpha1, a2_a, 100)
-        axes[0,0].plot(alpha_r2_a, cfun(alpha_r2_a) + params.Pi,
-                       'g--', lw=2, alpha=0.8, label='Analytical')
-        if nested_a['WNS'] > 0:
-            axes[0,0].plot(0, nested_a['r_NS'], 'gs', markersize=8,
+    if nested_disc is not None:
+        a2_d = nested_disc['alpha2']
+        axes[0,0].plot(np.linspace(alpha0, alpha1, 50),
+                       nested_disc['rp'] * np.ones(50), 'g--', lw=1.5, alpha=0.7, label='Nested discrete')
+        axes[0,0].plot(np.linspace(alpha1, a2_d, 50),
+                       cfun(np.linspace(alpha1, a2_d, 50)) + params.Pi, 'g--', lw=1.5, alpha=0.7)
+        if nested_disc['WNS'] > 0:
+            axes[0,0].plot(0, nested_disc['r_NS'], 'gs', markersize=8,
                            markerfacecolor='none', markeredgewidth=2)
 
     axes[0,0].axvline(alpha0, color='black', ls=':', alpha=0.3)
@@ -585,16 +626,15 @@ def plot_comparison(params, nested, iid, nested_a=None):
     # =========================================================================
     # Panel 2: Pool Quality gamma(alpha)
     # =========================================================================
-    axes[0,1].plot(nested['alphas_R1'][:-1], nested['gammas_R1'], 'b-', lw=2, label='Nested (discrete)')
+    axes[0,1].plot(nested['alphas_R1'], nested['gammas_R1'], 'b-', lw=2, label='Nested analytical')
     axes[0,1].plot(nested['alphas_R2'], nested['gammas_R2'], 'b-', lw=2)
     axes[0,1].plot(iid['alpha_eq'], iid['gamma_eq'], 'r-', lw=2, label='IID')
 
-    # Analytical overlay
-    if nested_a is not None:
-        axes[0,1].plot(nested_a['alphas_R1'], nested_a['gammas_R1'],
-                       'g--', lw=2, alpha=0.8, label='Analytical')
-        axes[0,1].plot(nested_a['alphas_R2'], nested_a['gammas_R2'],
-                       'g--', lw=2, alpha=0.8)
+    if nested_disc is not None:
+        axes[0,1].plot(nested_disc['alphas_R1'][:-1], nested_disc['gammas_R1'],
+                       'g--', lw=1.5, alpha=0.7, label='Nested discrete')
+        axes[0,1].plot(nested_disc['alphas_R2'], nested_disc['gammas_R2'],
+                       'g--', lw=1.5, alpha=0.7)
 
     axes[0,1].axvline(alpha0, color='black', ls=':', alpha=0.3)
     axes[0,1].axvline(alpha1, color='blue', ls=':', alpha=0.5)
@@ -608,34 +648,27 @@ def plot_comparison(params, nested, iid, nested_a=None):
     # =========================================================================
     # Panel 3: Cumulative Capital W(alpha)
     # =========================================================================
-    # Nested (discrete): atom at alpha=0, then flat until alpha0, then accumulate
     # Jump at alpha=0
     axes[1,0].plot([0, 0], [0, WNS], 'b-', lw=2)
     axes[1,0].plot(0, 0, 'bo', markersize=8, markerfacecolor='white', markeredgewidth=2)
-    axes[1,0].plot(0, WNS, 'bo', markersize=8, markerfacecolor='blue', label='Nested (discrete)')
-    # Flat from 0 to alpha0
+    axes[1,0].plot(0, WNS, 'bo', markersize=8, markerfacecolor='blue', label='Nested')
     alpha_flat = np.linspace(0, alpha0, 20)
     axes[1,0].plot(alpha_flat, WNS * np.ones_like(alpha_flat), 'b-', lw=2)
     # Region I
-    axes[1,0].plot(nested['alphas_R1'][1:], WNS + nested['W_cumsum_R1'], 'b-', lw=2)
+    axes[1,0].plot(nested['alphas_R1'], WNS + nested['W_cumsum_R1'], 'b-', lw=2)
     # Region II
     axes[1,0].plot(nested['alphas_R2'], WNS + nested['W_R2_cumsum'], 'b-', lw=2)
 
-    # Analytical overlay
-    if nested_a is not None:
-        WNS_a = nested_a['WNS']
-        # Jump at alpha=0
-        axes[1,0].plot([0, 0], [0, WNS_a], 'g--', lw=2, alpha=0.8)
-        axes[1,0].plot(0, WNS_a, 'gs', markersize=8, markerfacecolor='none',
-                       markeredgewidth=2, label='Analytical')
-        # Flat from 0 to alpha0
-        axes[1,0].plot(alpha_flat, WNS_a * np.ones_like(alpha_flat), 'g--', lw=2, alpha=0.8)
-        # Region I
-        axes[1,0].plot(nested_a['alphas_R1'], WNS_a + nested_a['W_cumsum_R1'],
-                       'g--', lw=2, alpha=0.8)
-        # Region II
-        axes[1,0].plot(nested_a['alphas_R2'], WNS_a + nested_a['W_R2_cumsum'],
-                       'g--', lw=2, alpha=0.8)
+    if nested_disc is not None:
+        WNS_d = nested_disc['WNS']
+        axes[1,0].plot([0, 0], [0, WNS_d], 'g--', lw=1.5, alpha=0.7)
+        axes[1,0].plot(0, WNS_d, 'gs', markersize=8, markerfacecolor='none',
+                       markeredgewidth=2, label='Nested discrete')
+        axes[1,0].plot(alpha_flat, WNS_d * np.ones_like(alpha_flat), 'g--', lw=1.5, alpha=0.7)
+        axes[1,0].plot(nested_disc['alphas_R1'][1:], WNS_d + nested_disc['W_cumsum_R1'],
+                       'g--', lw=1.5, alpha=0.7)
+        axes[1,0].plot(nested_disc['alphas_R2'], WNS_d + nested_disc['W_R2_cumsum'],
+                       'g--', lw=1.5, alpha=0.7)
 
     # IID
     alpha_before_iid = np.linspace(0, iid['alpha0'], 20)
@@ -654,23 +687,22 @@ def plot_comparison(params, nested, iid, nested_a=None):
     # =========================================================================
     # Panel 4: Remaining Borrowers
     # =========================================================================
-    axes[1,1].plot(nested['alphas_R1'][:-1], nested['GLOs_R1'], 'b-', lw=2, label='Discrete G')
-    axes[1,1].plot(nested['alphas_R1'][:-1], nested['BLOs_R1'], 'b--', lw=2, label='Discrete B')
+    axes[1,1].plot(nested['alphas_R1'], nested['GLOs_R1'], 'b-', lw=2, label='Analytical G')
+    axes[1,1].plot(nested['alphas_R1'], nested['BLOs_R1'], 'b--', lw=2, label='Analytical B')
     axes[1,1].plot(nested['alphas_R2'], nested['GLOs_R2'], 'b-', lw=2)
     axes[1,1].plot(nested['alphas_R2'], nested['BLOs_R2'], 'b--', lw=2)
     axes[1,1].plot(iid['alpha_eq'], iid['G_eq'], 'r-', lw=2, label='IID G')
     axes[1,1].plot(iid['alpha_eq'], iid['B_eq'], 'r--', lw=2, label='IID B')
 
-    # Analytical overlay
-    if nested_a is not None:
-        axes[1,1].plot(nested_a['alphas_R1'], nested_a['GLOs_R1'],
-                       'g-', lw=2, alpha=0.7, label='Analytical G')
-        axes[1,1].plot(nested_a['alphas_R1'], nested_a['BLOs_R1'],
-                       'g--', lw=2, alpha=0.7, label='Analytical B')
-        axes[1,1].plot(nested_a['alphas_R2'], nested_a['GLOs_R2'],
-                       'g-', lw=2, alpha=0.7)
-        axes[1,1].plot(nested_a['alphas_R2'], nested_a['BLOs_R2'],
-                       'g--', lw=2, alpha=0.7)
+    if nested_disc is not None:
+        axes[1,1].plot(nested_disc['alphas_R1'][:-1], nested_disc['GLOs_R1'],
+                       'g-', lw=1.5, alpha=0.7, label='Discrete G')
+        axes[1,1].plot(nested_disc['alphas_R1'][:-1], nested_disc['BLOs_R1'],
+                       'g--', lw=1.5, alpha=0.7, label='Discrete B')
+        axes[1,1].plot(nested_disc['alphas_R2'], nested_disc['GLOs_R2'],
+                       'g-', lw=1.5, alpha=0.7)
+        axes[1,1].plot(nested_disc['alphas_R2'], nested_disc['BLOs_R2'],
+                       'g--', lw=1.5, alpha=0.7)
 
     axes[1,1].axvline(alpha0, color='black', ls=':', alpha=0.3)
     axes[1,1].axvline(alpha1, color='blue', ls=':', alpha=0.5)
@@ -681,6 +713,7 @@ def plot_comparison(params, nested, iid, nested_a=None):
     axes[1,1].grid(alpha=0.3)
     axes[1,1].set_xlim([0, 1])
 
+    fig.suptitle(f'Nested vs IID  ({prior_desc})', fontsize=13)
     plt.tight_layout()
     return fig
 
@@ -922,6 +955,82 @@ def check_w_ratio(params, nested, iid):
     return ratio_formula, ratio_from_w
 
 
+def compare_analytical_vs_discrete(params):
+    """
+    Compare analytical and discrete solvers for the given parameters.
+    Works with any prior shape (a_g, a_b).
+    """
+    print("\n" + "=" * 70)
+    prior_desc = f"a_g={params.a_g}, a_b={params.a_b}"
+    if params.a_g == 0 and params.a_b == 0:
+        prior_desc += " (uniform)"
+    print(f"COMPARISON: Analytical vs Discrete  [{prior_desc}]")
+    print("=" * 70)
+
+    # Verify prior normalization
+    g_int, _ = quad(gpriorfun, 0, 1)
+    b_int, _ = quad(lambda x: bpriorfun(x, params.BperG), 0, 1)
+    print(f"  Prior normalization: int g = {g_int:.4f},  int b = {b_int:.4f} (BperG={params.BperG})")
+
+    # Run both solvers
+    nested_disc = solve_nested(params)
+    nested_anal = solve_nested_analytical(params)
+
+    print(f"  alpha0: anal={nested_anal['alpha0']:.6f}  disc={nested_disc['alpha0']:.6f}")
+    print(f"  alpha1: anal={nested_anal['alpha1']:.6f}  disc={nested_disc['alpha1']:.6f}")
+    print(f"  rp:     anal={nested_anal['rp']:.6f}  disc={nested_disc['rp']:.6f}")
+
+    # Compare gamma along Region I
+    alphas_d = nested_disc['alphas_R1'][:-1]
+    gammas_d = nested_disc['gammas_R1']
+    alphas_a = nested_anal['alphas_R1']
+    gammas_a = nested_anal['gammas_R1']
+
+    a_lo = max(alphas_d[0], alphas_a[0])
+    a_hi = min(alphas_d[-1], alphas_a[-1])
+    mask_a = (alphas_a >= a_lo) & (alphas_a <= a_hi)
+    mask_d = (alphas_d >= a_lo) & (alphas_d <= a_hi)
+
+    if np.sum(mask_d) > 10:
+        gammas_d_interp = np.interp(alphas_a[mask_a], alphas_d[mask_d], gammas_d[mask_d])
+        gamma_err = np.max(np.abs(gammas_a[mask_a] - gammas_d_interp))
+        gamma_err_rel = gamma_err / np.mean(gammas_d_interp) * 100
+    else:
+        gamma_err_rel = float('nan')
+
+    # Compare cumulative W
+    W_anal = nested_anal['W_cumsum_R1'][-1]
+    W_disc = nested_disc['W_cumsum_R1'][-1] if len(nested_disc['W_cumsum_R1']) > 0 else 0
+    W_err = abs(W_anal - W_disc) / abs(W_anal) * 100 if abs(W_anal) > 1e-12 else float('nan')
+
+    # Compare w at midpoint
+    mid_idx = len(nested_anal['ws_R1']) // 2
+    alpha_mid = nested_anal['alphas_R1'][mid_idx]
+    w_anal_mid = nested_anal['ws_R1'][mid_idx]
+    ws_disc_density = nested_disc['ws_R1'] / params.Delta
+    alphas_disc_mid = (nested_disc['alphas_R1'][:-1] + nested_disc['alphas_R1'][1:]) / 2
+    w_disc_mid = np.interp(alpha_mid, alphas_disc_mid, ws_disc_density)
+    w_err = abs(w_anal_mid - w_disc_mid) / abs(w_anal_mid) * 100 if abs(w_anal_mid) > 1e-12 else float('nan')
+
+    # badleftover and WNS
+    bl_anal, bl_disc = nested_anal['badleftover'], nested_disc['badleftover']
+    bl_err = abs(bl_anal - bl_disc) / abs(bl_disc) * 100 if abs(bl_disc) > 1e-12 else float('nan')
+    WNS_anal, WNS_disc = nested_anal['WNS'], nested_disc['WNS']
+    WNS_err = abs(WNS_anal - WNS_disc) / abs(WNS_disc) * 100 if abs(WNS_disc) > 1e-12 else float('nan')
+
+    print(f"  gamma max err: {gamma_err_rel:.4f}%")
+    print(f"  W(alpha_1):    anal={W_anal:.4f}  disc={W_disc:.4f}  err={W_err:.2f}%")
+    print(f"  w(mid):        anal={w_anal_mid:.4f}  disc={w_disc_mid:.4f}  err={w_err:.2f}%")
+    print(f"  badleftover:   anal={bl_anal:.6f}  disc={bl_disc:.6f}  err={bl_err:.2f}%")
+    print(f"  WNS:           anal={WNS_anal:.6f}  disc={WNS_disc:.6f}  err={WNS_err:.2f}%")
+    print(f"  E(alpha_0):    {nested_anal['E_R1'][0]:.6f}  (should be 1.0)")
+
+    ok = gamma_err_rel < 1.0 and W_err < 5.0
+    print(f"  VERDICT: {'PASS' if ok else 'CHECK'}")
+    print("=" * 70)
+    return ok
+
+
 def main():
     """Main function to run the model comparison."""
     params = Parameters()
@@ -930,56 +1039,28 @@ def main():
     print("CREDIT MARKET: NESTED vs IID INFORMATION STRUCTURES")
     print("=" * 60)
     print(f"Parameters: Pi={params.Pi}, beta={params.beta}, BperG={params.BperG}")
+    print(f"Priors: a_g={params.a_g}, a_b={params.a_b}  (0=uniform)")
     print("=" * 60)
 
-    # Solve nested (discrete)
-    print("\n--- Solving Nested Model (discrete) ---")
-    nested = solve_nested(params)
-    print(f"alpha0 = {nested['alpha0']:.4f}")
-    print(f"alpha1 = {nested['alpha1']:.4f}")
-    print(f"alpha2 = {nested['alpha2']:.4f}")
-    print(f"rp = {nested['rp']:.4f}")
-    print(f"r_NS = {nested['r_NS']:.4f}")
-    print(f"WNS = {nested['WNS']:.4f}")
-    print(f"Total W (Regions I+II) = {nested['W_R2_cumsum'][-1]:.4f}")
-    print(f"Total W (including NS) = {nested['W_R2_cumsum'][-1] + nested['WNS']:.4f}")
-
-    # Solve nested (analytical)
+    # Solve nested (analytical — primary solver)
     print("\n--- Solving Nested Model (analytical) ---")
     nested_a = solve_nested_analytical(params)
     print(f"alpha0 = {nested_a['alpha0']:.4f}")
     print(f"alpha1 = {nested_a['alpha1']:.4f}")
     print(f"alpha2 = {nested_a['alpha2']:.4f}")
     print(f"rp = {nested_a['rp']:.4f}")
+    print(f"r_NS = {nested_a['r_NS']:.4f}")
     print(f"WNS = {nested_a['WNS']:.4f}")
     print(f"Total W (Regions I+II) = {nested_a['W_R2_cumsum'][-1]:.4f}")
     print(f"Total W (including NS) = {nested_a['W_R2_cumsum'][-1] + nested_a['WNS']:.4f}")
 
-    # Compare analytical vs discrete
-    print("\n--- Analytical vs Discrete Comparison (Region I) ---")
-    a0 = nested_a['alpha0']
-    # w at alpha_0
-    w_analytical_a0 = nested_a['ws_R1'][0]
-    w_formula_a0 = compute_w_analytical(a0, nested_a['rp'], params.beta, params.BperG)[0]
-    print(f"  w^nested(alpha_0):  analytical solver = {w_analytical_a0:.4f}")
-    print(f"                      paper formula     = {w_formula_a0:.4f}")
-    print(f"                      discrete solver   = {nested['ws_R1'][0]/params.Delta:.4f}")
-    # gamma at alpha_0
-    print(f"  gamma(alpha_0):     analytical = {nested_a['gammas_R1'][0]:.6f}")
-    print(f"                      discrete   = {nested['gammas_R1'][0]:.6f}")
-    # B at alpha_0
-    print(f"  B(alpha_0):         analytical = {nested_a['B_R1'][0]:.6f}")
-    omg0 = params.beta + a0 * (1 - params.beta)
-    B0_exact = params.BperG * params.beta * (1 - a0)
-    print(f"                      exact      = {B0_exact:.6f}")
-    # G at alpha_0
-    print(f"  G(alpha_0):         analytical = {nested_a['G_R1'][0]:.6f}")
-    print(f"                      exact      = {omg0:.6f}")
-    # E at alpha_0 (should be 1)
-    print(f"  E(alpha_0):         analytical = {nested_a['E_R1'][0]:.6f}  (should be 1.0)")
-    # gamma at alpha_1 (should be 1)
-    print(f"  gamma(alpha_1):     analytical = {nested_a['gammas_R1'][-1]:.6f}  (should be 1.0)")
-    print(f"  B(alpha_1):         analytical = {nested_a['B_R1'][-1]:.6f}  (should be ~0)")
+    # Solve nested (discrete — for comparison)
+    print("\n--- Solving Nested Model (discrete) ---")
+    nested = solve_nested(params)
+    print(f"alpha0 = {nested['alpha0']:.4f}")
+    print(f"rp = {nested['rp']:.4f}")
+    print(f"WNS = {nested['WNS']:.4f}")
+    print(f"Total W (including NS) = {nested['W_R2_cumsum'][-1] + nested['WNS']:.4f}")
 
     # Solve IID
     print("\n--- Solving IID Model ---")
@@ -990,21 +1071,28 @@ def main():
     print(f"r_perfect = {iid['r_perfect']:.4f}")
     print(f"Total W = {iid['W_cumsum'][-1]:.4f}")
 
-    # Check Proposition (w-ratio) using analytical solver
-    check_w_ratio(params, nested_a, iid)
-
-    # Plot (overlay analytical curves in green dashes)
+    # Plot using analytical solver as primary nested solution
     print("\n--- Creating Plot ---")
-    fig = plot_comparison(params, nested, iid, nested_a=nested_a)
+    fig = plot_comparison(params, nested_a, iid, nested_disc=nested)
 
-    # Save in same folder as script (works on Windows and Linux)
+    # Save in same folder as script
     import os
     script_dir = os.path.dirname(os.path.abspath(__file__))
     output_path = os.path.join(script_dir, 'credit_model.png')
     plt.savefig(output_path, dpi=150, bbox_inches='tight')
     print(f"Plot saved to {output_path}")
 
-    return params, nested, iid
+    # Compare analytical vs discrete for current parameters
+    compare_analytical_vs_discrete(params)
+
+    # Also test with non-uniform priors if currently uniform
+    if params.a_g == 0 and params.a_b == 0:
+        for a_g, a_b in [(1.0, 1.0), (0.5, 0.3), (2.0, 0.0)]:
+            p = Parameters(Pi=params.Pi, beta=params.beta, BperG=params.BperG,
+                           Delta=params.Delta, delom=params.delom, a_g=a_g, a_b=a_b)
+            compare_analytical_vs_discrete(p)
+
+    return params, nested_a, iid
 
 if __name__ == "__main__":
     params, nested, iid = main()
