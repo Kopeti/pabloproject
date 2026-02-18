@@ -85,13 +85,34 @@ def gam0(alpha, params):
     return G / (G + B)
 
 def NSfun(al, beta, badleftover, Pi, BperG):
-    """No-screening equilibrium condition."""
+    """No-screening equilibrium condition (squared residual)."""
     omega_g = beta + al * (1 - beta)
     goodleftover, _ = quad(gpriorfun, omega_g, 1)
     if goodleftover + badleftover < 1e-12:
         return 1e10
     gammaNS = goodleftover / (goodleftover + badleftover)
     return (gammaNS * (1 + cfun(al) + Pi) - (1 + Pi)) ** 2
+
+def NSfun_signed(al, beta, badleftover, Pi, BperG):
+    """No-screening condition: gamma_NS*(1+K(alpha2)) - (1+Pi). Zero at equilibrium."""
+    omega_g = beta + al * (1 - beta)
+    goodleftover, _ = quad(gpriorfun, omega_g, 1)
+    if goodleftover + badleftover < 1e-12:
+        return -(1 + Pi)
+    gammaNS = goodleftover / (goodleftover + badleftover)
+    return gammaNS * (1 + cfun(al) + Pi) - (1 + Pi)
+
+def find_alpha2(alpha1, beta, badleftover, Pi, BperG, n_scan=500):
+    """Find smallest alpha2 > alpha1 satisfying the NS condition."""
+    als = np.linspace(alpha1 + 1e-4, 0.999, n_scan)
+    vals = np.array([NSfun_signed(a, beta, badleftover, Pi, BperG) for a in als])
+    # Look for sign changes (roots) and return the smallest root
+    for i in range(len(vals) - 1):
+        if vals[i] * vals[i+1] < 0:
+            alpha2 = brentq(lambda a: NSfun_signed(a, beta, badleftover, Pi, BperG),
+                            als[i], als[i+1])
+            return alpha2
+    return None  # no solution
 
 # =============================================================================
 # NESTED INFORMATION STRUCTURE
@@ -191,19 +212,15 @@ def solve_nested(params):
     # =========================================================================
     # Find alpha2 and WNS (non-selective lenders)
     # =========================================================================
-    res = minimize_scalar(
-        lambda al: NSfun(al, beta, badleftover, Pi, BperG),
-        bounds=(alpha1, 1.0), method='bounded'
-    )
-    alpha2 = res.x
-    
-    if NSfun(alpha2, beta, badleftover, Pi, BperG) < Delta:
+    alpha2 = find_alpha2(alpha1, beta, badleftover, Pi, BperG)
+
+    if alpha2 is not None:
         omega_g_alpha2 = beta + alpha2 * (1 - beta)
         goodleftover_alpha2, _ = quad(gpriorfun, omega_g_alpha2, 1)
         WNS = dfun(cfun(alpha2) + Pi) * (badleftover + goodleftover_alpha2)
     else:
         WNS, alpha2 = 0, 1.0
-    
+
     r_NS = cfun(alpha2) + Pi
     
     # =========================================================================
@@ -397,15 +414,11 @@ def solve_nested_analytical(params):
     badleftover = B_end_R1
 
     # =========================================================================
-    # Find alpha2 and WNS (non-selective lenders) — same logic as solve_nested
+    # Find alpha2 and WNS (non-selective lenders)
     # =========================================================================
-    res = minimize_scalar(
-        lambda al: NSfun(al, beta, badleftover, Pi, BperG),
-        bounds=(alpha1, 1.0), method='bounded'
-    )
-    alpha2 = res.x
+    alpha2 = find_alpha2(alpha1, beta, badleftover, Pi, BperG)
 
-    if NSfun(alpha2, beta, badleftover, Pi, BperG) < 0.01:
+    if alpha2 is not None:
         omega_g_alpha2 = beta + alpha2 * (1 - beta)
         goodleftover_alpha2, _ = quad(gpriorfun, omega_g_alpha2, 1)
         WNS = dfun(cfun(alpha2) + Pi) * (badleftover + goodleftover_alpha2)
