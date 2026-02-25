@@ -16,7 +16,7 @@ warnings.filterwarnings('ignore')
 
 def cfun(alpha):
     """Screening cost function c(alpha)."""
-    return 0.8 * alpha**2 + 0.5 * alpha
+    return 0.7 * alpha**2 + 0.5 * alpha
 
 def cfun_prime(alpha, eps=1e-5):
     """First derivative of cost function (numerical)."""
@@ -45,8 +45,8 @@ class Parameters:
     # Prior shape parameters (0 = uniform)
     # g(omega) = (1+a_g) * omega^a_g    -- integrates to 1 on [0,1]
     # b(omega) = BperG * (1+a_b) * (1-omega)^a_b  -- integrates to BperG on [0,1]
-    a_g: float = 0.05
-    a_b: float = 0.05
+    a_g: float = 0
+    a_b: float = 0
 
 # Global reference to current parameters (for prior functions)
 _current_params = Parameters()
