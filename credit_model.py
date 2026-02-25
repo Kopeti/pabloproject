@@ -441,6 +441,7 @@ def solve_nested_analytical(params):
         goodleftover_alpha2, _ = quad(gpriorfun, omega_g_alpha2, 1)
         WNS = dfun(cfun(alpha2) + Pi) * (badleftover + goodleftover_alpha2)
     else:
+        goodleftover_alpha2 = 0.0
         WNS, alpha2 = 0, 1.0
 
     r_NS = cfun(alpha2) + Pi
@@ -498,6 +499,7 @@ def solve_nested_analytical(params):
         'W_R2_cumsum': W_R2_cumsum,
         # Leftover
         'badleftover': badleftover,
+        'goodleftover_alpha2': goodleftover_alpha2,
         'G_end_R1': G_end_R1,
         'B_end_R1': B_end_R1,
     }
@@ -1054,6 +1056,54 @@ def compare_analytical_vs_discrete(params):
     return ok
 
 
+def compute_avg_good_rate(params, nested, iid):
+    """
+    Compute the average interest rate paid by good borrowers in each regime.
+
+    Weighted average: sum(rate * capital_to_good) / sum(capital_to_good)
+
+    Nested regions:
+      I   (alpha0..alpha1): rate = rp,            capital_to_good = gamma(alpha)*w(alpha)*da
+      II  (alpha1..alpha2): rate = cfun(al)+Pi,   capital_to_good = w(alpha)*da  [gamma=1]
+      III (non-selective):  rate = r_NS,           capital_to_good = gamma_NS * WNS
+    IID:
+      rate = r(alpha),  capital_to_good = gamma(alpha)*w(alpha)*da
+    """
+    Pi = params.Pi
+
+    # --- Nested ---
+    da_R1 = nested['da_R1']
+    # Region I
+    cap_good_R1 = nested['gammas_R1'] * nested['ws_R1'] * da_R1
+    rate_R1 = np.full_like(cap_good_R1, nested['rp'])
+
+    # Region II (gamma = 1 throughout)
+    alphas_R2 = nested['alphas_R2']
+    da_R2 = alphas_R2[1] - alphas_R2[0] if len(alphas_R2) > 1 else 0.0
+    cap_good_R2 = nested['ws_R2'] * da_R2          # gamma = 1
+    rate_R2 = np.array([cfun(al) + Pi for al in alphas_R2])
+
+    # Region III (non-selective)
+    goodleft = nested['goodleftover_alpha2']
+    badleft  = nested['badleftover']
+    gamma_NS = goodleft / (goodleft + badleft) if (goodleft + badleft) > 1e-12 else 0.0
+    cap_good_NS = gamma_NS * nested['WNS']
+    rate_NS     = nested['r_NS']
+
+    total_good_nested = np.sum(cap_good_R1) + np.sum(cap_good_R2) + cap_good_NS
+    avg_rate_nested   = (np.sum(rate_R1 * cap_good_R1)
+                         + np.sum(rate_R2 * cap_good_R2)
+                         + rate_NS * cap_good_NS) / total_good_nested
+
+    # --- IID ---
+    da_iid = iid['da']
+    cap_good_iid = iid['gamma_eq'] * iid['w_eq'] * da_iid
+    total_good_iid = np.sum(cap_good_iid)
+    avg_rate_iid   = np.sum(iid['r_eq'] * cap_good_iid) / total_good_iid
+
+    return avg_rate_nested, avg_rate_iid, total_good_nested, total_good_iid
+
+
 def main():
     """Main function to run the model comparison."""
     params = Parameters()
@@ -1093,6 +1143,13 @@ def main():
     print(f"r0 = {iid['r0']:.4f}")
     print(f"r_perfect = {iid['r_perfect']:.4f}")
     print(f"Total W = {iid['W_cumsum'][-1]:.4f}")
+
+    # Average interest rate for good borrowers
+    avg_r_nested, avg_r_iid, W_good_nested, W_good_iid = compute_avg_good_rate(params, nested_a, iid)
+    print("\n--- Average Interest Rate (good borrowers) ---")
+    print(f"Nested: {avg_r_nested:.6f}  (capital to good = {W_good_nested:.4f})")
+    print(f"IID:    {avg_r_iid:.6f}  (capital to good = {W_good_iid:.4f})")
+    print(f"Diff (nested - iid): {avg_r_nested - avg_r_iid:+.6f}")
 
     # Plot using analytical solver as primary nested solution
     print("\n--- Creating Plot ---")
