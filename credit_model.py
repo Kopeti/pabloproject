@@ -14,16 +14,34 @@ warnings.filterwarnings('ignore')
 # PRIMITIVE FUNCTIONS (easily modifiable)
 # =============================================================================
 
+# Cost function: c(alpha) = COST_C2 * alpha**COST_P2 + COST_C1 * alpha**COST_P1
+# Change these four parameters — cfun, cfun_prime_exact, cfun_prime2_exact
+# are all derived from them and stay consistent automatically.
+COST_C2 = 0.2
+COST_P2 = 2.0
+COST_C1 = 1.0
+COST_P1 = 1.0
+
 def cfun(alpha):
-    """Screening cost function c(alpha)."""
-    return 0.7 * alpha**2 + 0.5 * alpha
+    """Screening cost function c(alpha) = C2*alpha^P2 + C1*alpha^P1."""
+    return COST_C2 * alpha**COST_P2 + COST_C1 * alpha**COST_P1
+
+def cfun_prime_exact(alpha):
+    """Exact first derivative: c'(alpha) = C2*P2*alpha^(P2-1) + C1*P1*alpha^(P1-1)."""
+    return COST_C2 * COST_P2 * alpha**(COST_P2 - 1) + COST_C1 * COST_P1 * alpha**(COST_P1 - 1)
+
+def cfun_prime2_exact(alpha):
+    """Exact second derivative: c''(alpha) = C2*P2*(P2-1)*alpha^(P2-2) + C1*P1*(P1-1)*alpha^(P1-2)."""
+    t2 = COST_C2 * COST_P2 * (COST_P2 - 1) * alpha**(COST_P2 - 2) if COST_P2 > 1 else 0.0
+    t1 = COST_C1 * COST_P1 * (COST_P1 - 1) * alpha**(COST_P1 - 2) if COST_P1 > 1 else 0.0
+    return t2 + t1
 
 def cfun_prime(alpha, eps=1e-5):
-    """First derivative of cost function (numerical)."""
+    """First derivative of cost function (numerical fallback)."""
     return (cfun(alpha + eps) - cfun(alpha)) / eps
 
 def cfun_prime2(alpha, eps=1e-5):
-    """Second derivative of cost function (numerical)."""
+    """Second derivative of cost function (numerical fallback)."""
     return (cfun_prime(alpha + eps) - cfun_prime(alpha)) / eps
 
 def dfun(r0):
@@ -39,7 +57,7 @@ class Parameters:
     """Model parameters."""
     Pi: float = 0.05      # Profit margin
     beta: float = 0.1     # Signal precision parameter was 0.3
-    BperG: float = 0.2    # Ratio of bad to good borrowers
+    BperG: float = 0.2197  # Ratio of bad to good borrowers
     Delta: float = 0.001  # Step size for alpha iteration
     delom: float = 0.0001 # Step size for omega grid
     # Prior shape parameters (0 = uniform)
@@ -733,14 +751,6 @@ def plot_comparison(params, nested, iid, nested_disc=None):
 # =============================================================================
 # MAIN
 # =============================================================================
-
-def cfun_prime_exact(alpha):
-    """Exact first derivative of c(alpha) = 0.8*alpha^2 + 0.5*alpha."""
-    return 1.6 * alpha + 0.5
-
-def cfun_prime2_exact(alpha):
-    """Exact second derivative of c(alpha) = 0.8*alpha^2 + 0.5*alpha."""
-    return 1.6
 
 def compute_w_analytical(alpha0, rp, beta, BperG):
     """
