@@ -644,12 +644,19 @@ def plot_comparison(params, nested, iid, nested_disc=None):
             axes[0,0].plot(0, nested_disc['r_NS'], 'gs', markersize=8,
                            markerfacecolor='none', markeredgewidth=2)
 
+    # Average interest rate for good borrowers
+    avg_r_nested, avg_r_iid, _, _ = compute_avg_good_rate(params, nested, iid)
+    axes[0,0].axhline(avg_r_nested, color='blue', ls='--', lw=1.2, alpha=0.7,
+                      label=f'Nested avg r (good) = {avg_r_nested:.3f}')
+    axes[0,0].axhline(avg_r_iid, color='red', ls='--', lw=1.2, alpha=0.7,
+                      label=f'IID avg r (good) = {avg_r_iid:.3f}')
+
     axes[0,0].axvline(alpha0, color='black', ls=':', alpha=0.3)
     axes[0,0].axvline(alpha1, color='blue', ls=':', alpha=0.5)
     axes[0,0].axvline(alpha2, color='blue', ls=':', alpha=0.5)
     axes[0,0].set_xlabel(r'$\alpha$'); axes[0,0].set_ylabel(r'$r(\alpha)$')
     axes[0,0].set_title('Interest Rate')
-    axes[0,0].legend(loc='upper left', fontsize=9)
+    axes[0,0].legend(loc='upper left', fontsize=8)
     axes[0,0].grid(alpha=0.3)
     axes[0,0].set_xlim([0, 1]); axes[0,0].set_ylim([0, 1.5])
     axes[0,0].text((alpha0+alpha1)/2, rp - 0.06, 'I', fontsize=12, color='blue')
@@ -737,12 +744,35 @@ def plot_comparison(params, nested, iid, nested_disc=None):
         axes[1,1].plot(nested_disc['alphas_R2'], nested_disc['BLOs_R2'],
                        'g--', lw=1.5, alpha=0.7)
 
+    # Total demand satisfied: initial mass minus final remaining
+    G0 = 1.0
+    B0 = params.BperG
+    # Nested: final remaining after R1+R2 (NS lenders then serve all remainder)
+    G_rem_nested = nested['GLOs_R2'][-1]
+    B_rem_nested = nested['BLOs_R2'][-1]
+    G_served_nested = G0 - G_rem_nested
+    B_served_nested = B0 - B_rem_nested
+    # IID: final remaining
+    G_rem_iid = iid['G_eq'][-1]
+    B_rem_iid = iid['B_eq'][-1]
+    G_served_iid = G0 - G_rem_iid
+    B_served_iid = B0 - B_rem_iid
+
+    axes[1,1].axhline(G_served_nested, color='blue', ls='--', lw=1.2, alpha=0.7,
+                      label=f'Nested G served = {G_served_nested:.3f}')
+    axes[1,1].axhline(B_served_nested, color='blue', ls=':', lw=1.2, alpha=0.7,
+                      label=f'Nested B served = {B_served_nested:.3f}')
+    axes[1,1].axhline(G_served_iid, color='red', ls='--', lw=1.2, alpha=0.7,
+                      label=f'IID G served = {G_served_iid:.3f}')
+    axes[1,1].axhline(B_served_iid, color='red', ls=':', lw=1.2, alpha=0.7,
+                      label=f'IID B served = {B_served_iid:.3f}')
+
     axes[1,1].axvline(alpha0, color='black', ls=':', alpha=0.3)
     axes[1,1].axvline(alpha1, color='blue', ls=':', alpha=0.5)
     axes[1,1].axvline(alpha2, color='blue', ls=':', alpha=0.5)
     axes[1,1].set_xlabel(r'$\alpha$'); axes[1,1].set_ylabel('Mass')
     axes[1,1].set_title('Remaining Borrowers')
-    axes[1,1].legend(fontsize=8, ncol=2)
+    axes[1,1].legend(fontsize=7, ncol=2)
     axes[1,1].grid(alpha=0.3)
     axes[1,1].set_xlim([0, 1])
 
