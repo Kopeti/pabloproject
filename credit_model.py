@@ -1134,6 +1134,118 @@ def compute_avg_good_rate(params, nested, iid):
     return avg_rate_nested, avg_rate_iid, total_good_nested, total_good_iid
 
 
+def plot_cumulative_lending(params, nested, iid):
+    """
+    Plot cumulative total lending quantity to good and bad borrowers as alpha
+    increases from alpha=0 (non-selective lenders in nested) upward.
+
+    Quantity = D(r) * borrower mass served per unit alpha.  Since w(alpha)*da
+    already equals D(r)*mass (the solvers build D(r) into w), we can split
+    w*da into good and bad using gamma:
+        good contribution at alpha = gamma(alpha) * w(alpha) * da
+        bad  contribution at alpha = (1-gamma(alpha)) * w(alpha) * da
+
+    Nested ordering (lowest to highest alpha):
+        alpha=0  : non-selective (Region III) lenders — jump of WNS
+        0..alpha0: flat (no additional lenders in nested)
+        alpha0..alpha1: Region I  (pooling rate rp, mixed pool)
+        alpha1..alpha2: Region II (screening, gamma=1, only good borrowers)
+
+    IID ordering:
+        0..alpha0: zero lending
+        alpha0..alpha_bar: IID selective lenders
+    """
+    # -------------------------------------------------------------------------
+    # Nested: Region III (non-selective, at alpha=0)
+    # -------------------------------------------------------------------------
+    goodleft = nested['goodleftover_alpha2']
+    badleft  = nested['badleftover']
+    gamma_NS = goodleft / (goodleft + badleft) if (goodleft + badleft) > 1e-12 else 0.0
+    WNS       = nested['WNS']
+    Q_NS_good = WNS * gamma_NS
+    Q_NS_bad  = WNS * (1.0 - gamma_NS)
+
+    # -------------------------------------------------------------------------
+    # Nested: Region I (alpha0 to alpha1)
+    # -------------------------------------------------------------------------
+    da_R1     = nested['da_R1']
+    good_R1   = nested['gammas_R1'] * nested['ws_R1'] * da_R1   # per-step quantities
+    bad_R1    = (1.0 - nested['gammas_R1']) * nested['ws_R1'] * da_R1
+
+    cum_good_R1 = Q_NS_good + np.concatenate([[0.0], np.cumsum(good_R1[:-1])])
+    cum_bad_R1  = Q_NS_bad  + np.concatenate([[0.0], np.cumsum(bad_R1[:-1])])
+
+    # -------------------------------------------------------------------------
+    # Nested: Region II (alpha1 to alpha2, gamma=1 so all lending to good)
+    # -------------------------------------------------------------------------
+    alphas_R2 = nested['alphas_R2']
+    da_R2     = alphas_R2[1] - alphas_R2[0] if len(alphas_R2) > 1 else 0.01
+    good_R2   = nested['ws_R2'] * da_R2
+    bad_R2    = np.zeros_like(good_R2)
+
+    cum_good_R2 = cum_good_R1[-1] + np.concatenate([[0.0], np.cumsum(good_R2[:-1])])
+    cum_bad_R2  = cum_bad_R1[-1]  + np.concatenate([[0.0], np.cumsum(bad_R2[:-1])])
+
+    # -------------------------------------------------------------------------
+    # IID (alpha0 to alpha_bar)
+    # -------------------------------------------------------------------------
+    da_iid      = iid['da']
+    good_iid    = iid['gamma_eq'] * iid['w_eq'] * da_iid
+    bad_iid     = (1.0 - iid['gamma_eq']) * iid['w_eq'] * da_iid
+
+    cum_good_iid = np.concatenate([[0.0], np.cumsum(good_iid[:-1])])
+    cum_bad_iid  = np.concatenate([[0.0], np.cumsum(bad_iid[:-1])])
+
+    # -------------------------------------------------------------------------
+    # Plot
+    # -------------------------------------------------------------------------
+    alpha0 = nested['alpha0']
+    alpha1 = nested['alpha1']
+    alpha2 = nested['alpha2']
+    alpha_ns_flat  = np.linspace(0.0, alpha0, 30)
+    alpha_pre_iid  = np.linspace(0.0, iid['alpha0'], 20)
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+    prior_desc = ("uniform priors" if params.a_g == 0 and params.a_b == 0
+                  else f"a_g={params.a_g}, a_b={params.a_b}")
+
+    for ax, (cum_n_R1, cum_n_R2, cum_i, Q_ns, title) in zip(
+        axes,
+        [
+            (cum_good_R1, cum_good_R2, cum_good_iid, Q_NS_good, 'Good Borrowers'),
+            (cum_bad_R1,  cum_bad_R2,  cum_bad_iid,  Q_NS_bad,  'Bad Borrowers'),
+        ]
+    ):
+        # Nested: vertical jump at alpha=0 (NS lenders), then flat to alpha0
+        ax.plot([0, 0], [0, Q_ns], 'b-', lw=2)
+        ax.plot(alpha_ns_flat, Q_ns * np.ones_like(alpha_ns_flat), 'b-', lw=2,
+                label='Nested')
+        # Region I
+        ax.plot(nested['alphas_R1'], cum_n_R1, 'b-', lw=2)
+        # Region II
+        ax.plot(nested['alphas_R2'], cum_n_R2, 'b-', lw=2)
+
+        # IID: zero until alpha0, then cumulative
+        ax.plot(alpha_pre_iid, np.zeros_like(alpha_pre_iid), 'r-', lw=2, label='IID')
+        ax.plot(iid['alpha_eq'], cum_i, 'r-', lw=2)
+
+        # Boundary markers
+        ax.axvline(alpha0, color='blue', ls=':', alpha=0.4, label=f'alpha0={alpha0:.3f}')
+        ax.axvline(alpha1, color='blue', ls='--', alpha=0.4, label=f'alpha1={alpha1:.3f}')
+        ax.axvline(alpha2, color='blue', ls='-.', alpha=0.4, label=f'alpha2={alpha2:.3f}')
+
+        ax.set_xlabel(r'$\alpha$')
+        ax.set_ylabel('Cumulative lending quantity  D(r) x mass')
+        ax.set_title(title)
+        ax.legend(fontsize=8)
+        ax.grid(alpha=0.3)
+        ax.set_xlim([0, 1])
+
+    fig.suptitle(f'Cumulative Lending by Borrower Type  ({prior_desc})', fontsize=13)
+    plt.tight_layout()
+    return fig
+
+
 def main():
     """Main function to run the model comparison."""
     params = Parameters()
@@ -1191,6 +1303,12 @@ def main():
     output_path = os.path.join(script_dir, 'credit_model.png')
     plt.savefig(output_path, dpi=150, bbox_inches='tight')
     print(f"Plot saved to {output_path}")
+
+    # Cumulative lending by borrower type
+    fig2 = plot_cumulative_lending(params, nested_a, iid)
+    output_path2 = os.path.join(script_dir, 'credit_model_lending.png')
+    fig2.savefig(output_path2, dpi=150, bbox_inches='tight')
+    print(f"Lending plot saved to {output_path2}")
 
     # Compare analytical vs discrete for current parameters
     compare_analytical_vs_discrete(params)
