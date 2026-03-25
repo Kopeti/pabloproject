@@ -29,13 +29,39 @@ PARAM_CONFIGS = {
     'original': {
         'Pi': 0.2, 'beta': 0.5, 'BperG': 1.0,
         'cfun': lambda alpha: 9.0 * alpha**2 + 0.2 * alpha,
+        # Entry parameters
+        'PiE': 0.1, 'kappa1': -4.0,
+        'cfunE_mode': 'complex',  # 'complex' = original MATLAB cfunE, 'simple' = polynomial
+        'cfunE_simple': None,     # set below if cfunE_mode == 'simple'
+        'cfunE_eps': 0.0,         # regularization eps (only for 'smooth')
+    },
+    'smooth_entry': {
+        'Pi': 0.2, 'beta': 0.5, 'BperG': 1.0,
+        'cfun': lambda alpha: 9.0 * alpha**2 + 0.2 * alpha,
+        # Same as original but cfunE uses PCHIP interpolant (monotone, smooth)
+        'PiE': 0.1, 'kappa1': -4.0,
+        'cfunE_mode': 'smooth',
+        'cfunE_simple': None,
+        'cfunE_eps': 0.0,
+    },
+    'simple_entry': {
+        'Pi': 0.2, 'beta': 0.5, 'BperG': 1.0,
+        'cfun': lambda alpha: 9.0 * alpha**2 + 0.2 * alpha,
+        # Entry: same incumbent cost shape but shifted down for entrant advantage
+        'PiE': 0.1, 'kappa1': 0.0,
+        'cfunE_mode': 'simple',
+        'cfunE_simple': lambda alpha: 7.0 * alpha**2 + 0.15 * alpha,
+        'cfunE_eps': 0.0,
     },
     'credit_model': {
         'Pi': 0.05, 'beta': 0.1, 'BperG': 0.2197,
         'cfun': lambda alpha: 0.2 * alpha**2 + 1.0 * alpha,
+        'PiE': 0.1, 'kappa1': -4.0,
+        'cfunE_mode': 'complex',
+        'cfunE_simple': None,
     },
 }
-ACTIVE_CONFIG = 'original'  # switch here or set programmatically before calling run_baseline()
+ACTIVE_CONFIG = 'smooth_entry'  # switch here or set programmatically before calling run_baseline()
 
 
 def _scalar(x):
@@ -341,11 +367,98 @@ def gammaupdate2(alvec, alstart, r):
     return _scalar(gamma[0]) if n_alvec == 1 else gamma
 
 
+def _build_cfunE_pchip():
+    """Build a monotone PCHIP interpolant of the original (complex) cfunE.
+
+    Evaluates the singular cfunE on a dense grid (values are finite due to the
+    maxc cap).  The base_cost component depends on gammaupdate2 which has
+    discrete omega-grid noise; this is smoothed with a Savitzky-Golay filter
+    before combining with the smooth distortion and addon terms.
+    The PCHIP interpolant is then monotone and smooth.
+    Stored on g._cfunE_pchip for reuse.
+    """
+    from scipy.interpolate import PchipInterpolator
+    from scipy.signal import savgol_filter
+
+    # Evaluate original complex cfunE components on a dense grid
+    # Avoid exactly a = maxa (use maxa - tiny offset instead)
+    maxa = g.alpha1
+    n_grid = 500
+    grid_left = np.linspace(0.001, maxa - 0.0005, n_grid // 2)
+    grid_right = np.linspace(maxa + 0.0005, 0.999, n_grid // 2)
+    grid = np.concatenate([grid_left, [maxa - 1e-6], grid_right])
+    grid.sort()
+
+    alpha1 = g.alpha1
+    maxc = 100.0
+    kappa = 1.1
+    alphabar = (g.alpha0 + g.alpha1) / 2.0
+
+    # Evaluate each component separately
+    base_costs = np.zeros(len(grid))
+    distortions = np.zeros(len(grid))
+    addons = np.zeros(len(grid))
+
+    for i, a in enumerate(grid):
+        gu = _scalar(gammaupdate2(a, g.alpha0, g.rp))
+        inner_r = (g.Pi + 1 + _scalar(cfun(a))) / gu - 1
+        base_costs[i] = gu * (1 + _scalar(dfuninv(kappa * _scalar(dfun(inner_r))))) - (1 + g.PiE)
+        distortions[i] = g.kappa1 * a * (a - alphabar)
+        if a < alpha1:
+            addons[i] = 0.1 * min(0.1 * (1.0 / max(alpha1 - a, 1e-6) - 1.0 / alpha1), maxc)
+        elif a > alpha1:
+            addons[i] = 0.1 * (maxc + (a - alpha1))
+        else:
+            addons[i] = 0.1 * maxc
+
+    # Smooth base_cost: this is the noisy component (from discrete omega grid).
+    # Savitzky-Golay: polynomial degree 3, window ~5% of grid points.
+    win = min(len(grid) // 10, 51)
+    if win % 2 == 0:
+        win += 1  # must be odd
+    base_costs_smooth = savgol_filter(base_costs, win, 3)
+
+    raw_vals = base_costs + distortions + addons
+    vals = base_costs_smooth + distortions + addons
+
+    max_smooth_err = np.max(np.abs(base_costs - base_costs_smooth))
+    print(f"  Smoothed base_cost: Savitzky-Golay window={win}, "
+          f"max |raw - smooth| = {max_smooth_err:.6f}")
+
+    g._cfunE_pchip = PchipInterpolator(grid, vals)
+    g._cfunE_pchip_grid = grid
+    g._cfunE_pchip_vals = vals
+    g._cfunE_pchip_vals_raw = raw_vals
+    print(f"  Built PCHIP interpolant for cfunE: {len(grid)} points, "
+          f"range [{vals.min():.3f}, {vals.max():.3f}]")
+
+
 def cfunE(alpha):
     """
-    Entry cost function for new entrants. Matches cfunE.m
-    Uses globals: rp, Pi, PiE, alpha0, alpha1, kappa1
+    Entry cost function for new entrants.
+
+    Modes:
+      'simple'  — smooth polynomial from PARAM_CONFIGS.
+      'complex' — original MATLAB cfunE.m (singular 1/(maxa-a) addon).
+      'smooth'  — PCHIP interpolant of complex cfunE: preserves values,
+                   monotone, smooth derivatives everywhere.
     """
+    cfg = PARAM_CONFIGS[ACTIVE_CONFIG]
+
+    if cfg['cfunE_mode'] == 'simple':
+        alpha_arr = np.atleast_1d(np.asarray(alpha, dtype=float))
+        ca = cfg['cfunE_simple'](alpha_arr)
+        return _scalar(ca[0]) if len(alpha_arr) == 1 else ca
+
+    if cfg['cfunE_mode'] == 'smooth':
+        # Use PCHIP interpolant (built once, cached on g)
+        if not hasattr(g, '_cfunE_pchip') or g._cfunE_pchip is None:
+            _build_cfunE_pchip()
+        alpha_arr = np.atleast_1d(np.asarray(alpha, dtype=float))
+        ca = g._cfunE_pchip(alpha_arr)
+        return _scalar(ca[0]) if len(alpha_arr) == 1 else ca
+
+    # --- Complex mode (original MATLAB cfunE) ---
     alpha = np.atleast_1d(np.asarray(alpha, dtype=float))
     ca = np.zeros(len(alpha))
 
@@ -372,7 +485,7 @@ def cfunE(alpha):
         elif a > maxa:
             addon = 0.1 * (maxc + (a - maxa))
         else:
-            addon = 0.0  # both boolean conditions false when a == maxa
+            addon = 0.0
 
         ca[i] = base_cost + distortion + addon
 
@@ -380,7 +493,11 @@ def cfunE(alpha):
 
 
 def cfunE_prime(alpha, eps=1e-5):
-    """Numerical first derivative of entry cost function."""
+    """First derivative of entry cost function.
+    Uses PCHIP analytical derivative for smooth mode, numerical otherwise."""
+    cfg = PARAM_CONFIGS[ACTIVE_CONFIG]
+    if cfg['cfunE_mode'] == 'smooth' and hasattr(g, '_cfunE_pchip') and g._cfunE_pchip is not None:
+        return _scalar(g._cfunE_pchip(np.atleast_1d(alpha), 1)[0])
     return (_scalar(cfunE(alpha + eps)) - _scalar(cfunE(alpha - eps))) / (2 * eps)
 
 
@@ -829,10 +946,61 @@ def run_baseline():
 
 
 # =============================================================================
+# Polynomial approximation of cfunE for analytical entry solver
+# =============================================================================
+
+def fit_cfunE_smooth(alpha0E, alpha1E, n_fit=300, smoothing=0):
+    """
+    Build a smooth interpolant of cfunE(alpha) on [alpha0E, alpha1E].
+
+    cfunE depends on the discrete omega-grid depletion, so its values (and
+    especially its numerical derivative) are noisy.  A cubic spline gives
+    a smooth, analytically differentiable approximation that handles the
+    steep rise near alpha1 much better than a global polynomial.
+
+    Parameters
+    ----------
+    alpha0E, alpha1E : float — domain
+    n_fit : int — number of evaluation points
+    smoothing : float — spline smoothing (0 = interpolating spline)
+
+    Returns
+    -------
+    dict with keys:
+        spline     : CubicSpline — interpolant for cfunE(alpha)
+        alpha_fit  : array — grid used for fitting
+        cfunE_fit  : array — raw cfunE values on the grid
+        max_err    : float — max |cfunE - spline| on the grid
+    """
+    from scipy.interpolate import CubicSpline
+
+    alpha_fit = np.linspace(alpha0E, alpha1E, n_fit)
+    cfunE_vals = np.array([_scalar(cfunE(a)) for a in alpha_fit])
+
+    # Build cubic spline (smooth, with analytical derivative)
+    cs = CubicSpline(alpha_fit, cfunE_vals)
+
+    cfunE_spline_vals = cs(alpha_fit)
+    max_err = np.max(np.abs(cfunE_vals - cfunE_spline_vals))
+
+    print(f"  Cubic spline fit to cfunE: n_fit={n_fit}")
+    print(f"    max |cfunE - spline| = {max_err:.6e}")
+    print(f"    cfunE range: [{cfunE_vals.min():.6f}, {cfunE_vals.max():.6f}]")
+
+    return {
+        'spline': cs,
+        'alpha_fit': alpha_fit,
+        'cfunE_fit': cfunE_vals,
+        'max_err': max_err,
+    }
+
+
+# =============================================================================
 # Analytical entry equilibrium — Region I (pooling)
 # =============================================================================
 
-def solve_entry_pooling_analytical(rpE, alpha0E, alpha1E, n_pts=500):
+def solve_entry_pooling_analytical(rpE, alpha0E, alpha1E, n_pts=500,
+                                   cfunE_poly_info=None):
     """
     Analytical T^E construction for entry Region I (pooling).
 
@@ -849,6 +1017,8 @@ def solve_entry_pooling_analytical(rpE, alpha0E, alpha1E, n_pts=500):
     alpha0E : float — marginal entrant skill
     alpha1E : float — upper boundary of entry pooling region
     n_pts : int — grid points (default 500)
+    cfunE_poly_info : dict or None — if provided, use smooth spline
+        approximation (output of fit_cfunE_smooth) for KE and KE'.
 
     Returns
     -------
@@ -870,10 +1040,16 @@ def solve_entry_pooling_analytical(rpE, alpha0E, alpha1E, n_pts=500):
                          for ob in omega_b_vals])
 
     # K^E(alpha) = PiE + cfunE(alpha) and its derivative
-    print("  Computing cfunE on grid...")
-    KE = np.array([g.PiE + _scalar(cfunE(a)) for a in alphas])
-    print("  Computing cfunE derivative...")
-    KE_prime = np.array([cfunE_prime(a) for a in alphas])
+    if cfunE_poly_info is not None:
+        cs = cfunE_poly_info['spline']
+        KE = g.PiE + cs(alphas)
+        KE_prime = cs(alphas, 1)  # analytical first derivative of cubic spline
+        print(f"  Using cubic spline cfunE")
+    else:
+        print("  Computing cfunE on grid (raw)...")
+        KE = np.array([g.PiE + _scalar(cfunE(a)) for a in alphas])
+        print("  Computing cfunE derivative (numerical)...")
+        KE_prime = np.array([cfunE_prime(a) for a in alphas])
 
     # Effective range: only where KE < rpE (entry is profitable)
     # Beyond this, the T^E formula gives negative/nonsensical values.
@@ -924,9 +1100,27 @@ def solve_entry_pooling_analytical(rpE, alpha0E, alpha1E, n_pts=500):
     w_total = theta * D_rpE * TE
     w_total = np.maximum(w_total, 0)
 
-    # Incumbent w at entry alphas (interpolated from baseline fine grid)
-    w_incumbent = np.interp(alphas, g.baseline_alphas_fine,
-                            g.baseline_w_fine, left=0, right=0)
+    # Boundary fix: near alpha1E, theta→∞ and T→0 (0×∞ indeterminate form)
+    # creates a spike in w_total at the last 1-2 grid points. Zero out where
+    # rpE - KE < 0.005 (entry is negligible: T^E ≈ 0).
+    boundary_mask = (rpE - KE) < 0.005
+    w_total[boundary_mask] = 0.0
+
+    # Incumbent w at entry alphas:
+    #   - Region I (alpha <= alpha1): pooling density from baseline fine grid
+    #   - Region II (alpha > alpha1): CIM density D(r_CIM) * g_tilde * (1-beta)
+    w_inc_pooling = np.interp(alphas, g.baseline_alphas_fine,
+                              g.baseline_w_fine, left=0, right=0)
+    w_inc_cim = np.zeros_like(alphas)
+    cim_mask = alphas > g.alpha1
+    if np.any(cim_mask):
+        for j in np.where(cim_mask)[0]:
+            a_j = alphas[j]
+            if a_j <= g.alpha2:
+                r_cim_j = _scalar(cfun(a_j)) + g.Pi
+                w_inc_cim[j] = (_scalar(dfun(r_cim_j)) *
+                                (1 - beta) * gpriorfun_scalar(beta + a_j * (1 - beta)))
+    w_incumbent = w_inc_pooling + w_inc_cim
 
     # Entry density (ironed: entrants only where total exceeds incumbent)
     wE = np.maximum(0, w_total - w_incumbent)
@@ -979,8 +1173,9 @@ def run_mainE():
     print("=" * 60)
 
     # ---------- Settings ----------
-    g.kappa1 = -4.0   # positive: BLO up, negative: BLO goes down
-    g.PiE = 0.1       # profit for new entrants
+    cfg = PARAM_CONFIGS[ACTIVE_CONFIG]
+    g.kappa1 = cfg.get('kappa1', -4.0)
+    g.PiE = cfg.get('PiE', 0.1)
 
     print(f"  kappa1 = {g.kappa1}")
     print(f"  PiE    = {g.PiE}")
@@ -1236,19 +1431,46 @@ def run_mainE():
     # ---------- Analytical entry comparison (Region I only) ----------
     if g.rpE < g.rp:
         print("\n  --- Analytical Entry (Region I) ---")
-        entry_ana = solve_entry_pooling_analytical(g.rpE, g.alpha0E, g.alpha1E)
+        cfg = PARAM_CONFIGS[ACTIVE_CONFIG]
 
-        # Compare total entry capital in pooling region
+        if cfg['cfunE_mode'] == 'simple':
+            # cfunE is already a smooth polynomial — no spline needed.
+            # Run analytical with raw cfunE directly (it IS smooth).
+            print("  [Simple cfunE — no spline needed]")
+            entry_ana = solve_entry_pooling_analytical(
+                g.rpE, g.alpha0E, g.alpha1E, cfunE_poly_info=None)
+            entry_ana_raw = entry_ana  # same thing
+            g.cfunE_poly_info = None
+        else:
+            # Complex cfunE — fit spline for smooth analytical version
+            poly_info = fit_cfunE_smooth(g.alpha0E, g.alpha1E, n_fit=300)
+            g.cfunE_poly_info = poly_info
+
+            print("  [Spline cfunE]")
+            entry_ana = solve_entry_pooling_analytical(
+                g.rpE, g.alpha0E, g.alpha1E, cfunE_poly_info=poly_info)
+
+            print("  [Raw cfunE]")
+            entry_ana_raw = solve_entry_pooling_analytical(
+                g.rpE, g.alpha0E, g.alpha1E, cfunE_poly_info=None)
+
+        # Compare: discrete vs analytical
         WE_disc = np.sum(wmassE)
         WE_ana = entry_ana['WE_cumsum'][-1]
-        print(f"  Discrete  total W^E (pooling) = {WE_disc:.6f}")
-        print(f"  Analytical total W^E (pooling) = {WE_ana:.6f}")
-        print(f"  Difference = {WE_ana - WE_disc:.6f}")
+        WE_raw = entry_ana_raw['WE_cumsum'][-1]
+        print(f"\n  === Region I Entry Capital Comparison ===")
+        print(f"  Discrete            W^E = {WE_disc:.6f}")
+        print(f"  Analytical          W^E = {WE_ana:.6f}")
+        if entry_ana is not entry_ana_raw:
+            print(f"  Analytical (raw)    W^E = {WE_raw:.6f}")
+        print(f"  Analytical - Discrete   = {WE_ana - WE_disc:.6f}")
 
         # Store for later plotting
         g.entry_analytical = entry_ana
+        g.entry_analytical_raw = entry_ana_raw if entry_ana is not entry_ana_raw else None
     else:
         g.entry_analytical = None
+        g.entry_analytical_raw = None
 
     # ---------- Calculate non-selective and CIM ----------
     print("  Computing non-selective and CIM regions...")
@@ -1421,6 +1643,15 @@ def run_mainE():
     whereisentry = np.where(wmassE > g.Delta / 100)[0]
     maxentry = whereisentry[-1] if len(whereisentry) > 0 else 0
 
+    # Analytical last entry: last alpha where w^E > 0
+    if g.entry_analytical is not None:
+        ea_wE = g.entry_analytical['wE']
+        ea_al = g.entry_analytical['alphas']
+        active = ea_wE > 1e-6
+        last_entry_alpha = ea_al[active][-1] if np.any(active) else g.alpha0E
+    else:
+        last_entry_alpha = almassE[maxentry] if maxentry < len(almassE) else g.alpha0E
+
     fig, axes = plt.subplots(2, 2, figsize=(12, 10))
 
     # --- Subplot 1: Interest rate ---
@@ -1438,10 +1669,9 @@ def run_mainE():
         ax1.axvline(g.alpha1E, color='b', linestyle=':', linewidth=0.8)
         ax1.text(g.alpha1E, ax1.get_ylim()[1], r'$\alpha_1^E$', color='b', fontsize=8,
                  ha='center', va='bottom')
-        if maxentry < len(almassE):
-            ax1.axvline(almassE[maxentry], color='b', linestyle=':', linewidth=0.8)
-            ax1.text(almassE[maxentry], ax1.get_ylim()[1], 'last entry', color='b',
-                     fontsize=8, ha='center', va='bottom')
+        ax1.axvline(last_entry_alpha, color='b', linestyle=':', linewidth=0.8)
+        ax1.text(last_entry_alpha, ax1.get_ylim()[1], 'last entry', color='b',
+                 fontsize=8, ha='center', va='bottom')
     ax1.axvline(g.alpha2E, color='b', linestyle=':', linewidth=0.8)
     ax1.text(g.alpha2E, ax1.get_ylim()[1], r'$\alpha_2^E$', color='b', fontsize=8,
              ha='center', va='bottom')
@@ -1459,15 +1689,43 @@ def run_mainE():
         x_new = np.concatenate([x_new, np.linspace(g.alpha2E, 1, len(WE) - len(x_new))])
     x_new = x_new[:len(WE)]
 
-    ax2.scatter(x_new, WE, s=3, label='new entrants')
+    ax2.scatter(x_new, WE, s=5, c='k', zorder=3, label='discrete entry')
     # Extend flat to the right
-    ax2.scatter(np.linspace(g.alpha2E, 1, 100), WE[-1] * np.ones(100), s=3)
+    ax2.scatter(np.linspace(g.alpha2E, 1, 100), WE[-1] * np.ones(100), s=5, c='k')
     ax2.set_ylim([0, 1.5])
-    ax2.axvline(g.alpha0E, color='b', linestyle=':', linewidth=0.8)
-    if maxentry < len(almassE):
-        ax2.axvline(almassE[maxentry], color='b', linestyle=':', linewidth=0.8)
-    ax2.set_xlabel(r'$\alpha$')
-    ax2.set_title('cumulative wealth')
+
+    # Analytical cumulative entry wealth (Region I + CIM + NS)
+    if g.entry_analytical is not None:
+        ea = g.entry_analytical
+        WE_R1_total = ea['WE_cumsum'][-1]  # Region I total
+
+        # Region II (CIM) entry: compute density and integrate
+        if g.alpha2E > g.alpha1E:
+            n_cim_ana = 200
+            cim_ana_al = np.linspace(g.alpha1E, g.alpha2E, n_cim_ana)
+            da_cim = cim_ana_al[1] - cim_ana_al[0] if n_cim_ana > 1 else 0
+            wE_cim_ana = np.zeros(n_cim_ana)
+            for j, a in enumerate(cim_ana_al):
+                r_inc = _scalar(cfun(a)) + g.Pi
+                r_ent = _scalar(cfunE(a)) + g.PiE
+                g_tilde_j = gpriorfun_scalar(g.beta + a * (1 - g.beta))
+                if r_inc > r_ent:
+                    wE_cim_ana[j] = ((_scalar(dfun(r_ent)) - _scalar(dfun(r_inc))) *
+                                     (1 - g.beta) * g_tilde_j)
+            WE_cim_cumsum = WE_R1_total + np.cumsum(wE_cim_ana) * da_cim
+        else:
+            cim_ana_al = np.array([g.alpha1E])
+            WE_cim_cumsum = np.array([WE_R1_total])
+
+        # NS entry (already computed in discrete code as WNSE)
+        WE_ana_total = WE_cim_cumsum[-1] + WNSE
+
+        # Plot: Region I + CIM + NS as one continuous line
+        ana_alphas = np.concatenate([ea['alphas'], cim_ana_al])
+        ana_cumsum = np.concatenate([ea['WE_cumsum'], WE_cim_cumsum])
+        ax2.plot(ana_alphas, ana_cumsum, 'b-', lw=2, label='analytical entry')
+        # Flat extension after alpha2E
+        ax2.plot([g.alpha2E, 1.0], [WE_ana_total, WE_ana_total], 'b-', lw=2)
 
     # Baseline cumulative wealth
     x_base = np.concatenate([[0], g.almassshort,
@@ -1477,7 +1735,16 @@ def run_mainE():
     x_base = x_base[:n_W] if len(x_base) >= n_W else np.concatenate([x_base, np.full(n_W - len(x_base), x_base[-1])])
     ax2.scatter(x_base, g.W, s=3, c='r', label='incumbent')
     ax2.scatter(np.linspace(g.alpha2, 1, 10), g.W[-1] * np.ones(10), s=3, c='r')
-    ax2.legend(fontsize=8)
+
+    # Threshold lines
+    ax2.axvline(g.alpha0E, color='blue', ls=':', lw=0.8, alpha=0.5)
+    ax2.axvline(g.alpha1E, color='blue', ls='--', lw=0.8, alpha=0.5)
+    ax2.axvline(g.alpha2E, color='blue', ls='-.', lw=0.8, alpha=0.5)
+    ax2.axvline(g.alpha1, color='red', ls='--', lw=0.8, alpha=0.5)
+
+    ax2.set_xlabel(r'$\alpha$')
+    ax2.set_title('cumulative wealth')
+    ax2.legend(fontsize=7)
 
     # --- Subplot 3: Cost + Pi ---
     ax3 = axes[1, 0]
@@ -1486,6 +1753,12 @@ def run_mainE():
     cost_base = cfun(al_plot) + g.Pi
     ax3.plot(al_plot, cost_new, label='new entrants')
     ax3.plot(al_plot, cost_base, label='incumbent')
+    # Spline approximation of cfunE (if available)
+    if hasattr(g, 'cfunE_poly_info') and g.cfunE_poly_info is not None:
+        cs = g.cfunE_poly_info['spline']
+        al_spline = np.linspace(g.alpha0E, g.alpha1E, 200)
+        ax3.plot(al_spline, cs(al_spline) + g.PiE, 'g--', lw=1.5,
+                 label='spline approx')
     ax3.legend()
     ax3.set_title(r'cost + $\Pi$')
     ax3.set_xlabel(r'$\alpha$')
@@ -1493,23 +1766,64 @@ def run_mainE():
     # --- Subplot 4: Discrete vs Analytical entry w^E ---
     ax4 = axes[1, 1]
     if g.entry_analytical is not None:
-        ea = g.entry_analytical
-        # Analytical: w^E density
-        ax4.plot(ea['alphas'], ea['wE'], 'b-', lw=1.5, label='analytical $w^E$')
-        ax4.plot(ea['alphas'], ea['w_total'], 'g--', lw=1, alpha=0.6,
-                 label='analytical total')
+        ea = g.entry_analytical       # polynomial version
+        ea_raw = g.entry_analytical_raw  # raw cfunE version
+
+        # Analytical (polynomial): w^E density
+        ax4.plot(ea['alphas'], ea['wE'], 'b-', lw=1.5,
+                 label='analytical (poly) $w^E$')
+        # Incumbent w: pooling region (from analytical) + CIM region extension
         ax4.plot(ea['alphas'], ea['w_incumbent'], 'r--', lw=1, alpha=0.6,
                  label='incumbent $w$')
+        # Extend incumbent w into CIM region (alpha1 to alpha2)
+        if g.alpha2 > g.alpha1:
+            cim_ext = np.linspace(g.alpha1 + 0.001, g.alpha2, 100)
+            w_cim_ext = np.array([
+                _scalar(dfun(cfun(a) + g.Pi)) *
+                (1 - g.beta) * gpriorfun_scalar(g.beta + a * (1 - g.beta))
+                for a in cim_ext])
+            ax4.plot(cim_ext, w_cim_ext, 'r--', lw=1, alpha=0.6)
+
+        # Analytical CIM entry density (Region II: alpha1E to alpha2E)
+        # Entry where entrant cost < incumbent cost: w^E = (D(r_ent) - D(r_inc)) * g * (1-beta)
+        if g.alpha2E > g.alpha1E:
+            cim_entry_al = np.linspace(g.alpha1E + 0.001, g.alpha2E, 200)
+            wE_cim = np.zeros(len(cim_entry_al))
+            for j, a in enumerate(cim_entry_al):
+                r_inc = _scalar(cfun(a)) + g.Pi
+                r_ent = _scalar(cfunE(a)) + g.PiE
+                g_tilde_j = gpriorfun_scalar(g.beta + a * (1 - g.beta))
+                if r_inc > r_ent:
+                    # Entrant has cost advantage — total demand is D(r_ent),
+                    # incumbent supplies D(r_inc), entrant fills the gap
+                    wE_cim[j] = ((_scalar(dfun(r_ent)) - _scalar(dfun(r_inc))) *
+                                 (1 - g.beta) * g_tilde_j)
+            if np.any(wE_cim > 0):
+                ax4.plot(cim_entry_al, wE_cim, 'b-', lw=1, alpha=0.7)
+
         # Discrete: wmassE / Delta (convert mass to density)
         disc_alphas = almassE[:-1] if len(almassE) > 1 else almassE
         disc_density = wmassE / g.Delta if g.Delta > 0 else wmassE
         if len(disc_alphas) == len(disc_density):
             ax4.scatter(disc_alphas, disc_density, s=8, c='k', zorder=3,
                         label='discrete $w^E/\\Delta$')
+        # Baseline thresholds
+        ax4.axvline(g.alpha0, color='red', ls=':', lw=0.8, label=r'$\alpha_0$')
+        ax4.axvline(g.alpha1, color='red', ls='--', lw=0.8, label=r'$\alpha_1$')
+        ax4.axvline(g.alpha2, color='red', ls='-.', lw=0.8, label=r'$\alpha_2$')
+        # Entry thresholds
+        ax4.axvline(g.alpha0E, color='blue', ls=':', lw=0.8, label=r'$\alpha_0^E$')
+        ax4.axvline(g.alpha1E, color='blue', ls='--', lw=0.8, label=r'$\alpha_1^E$')
+        ax4.axvline(g.alpha2E, color='blue', ls='-.', lw=0.8, label=r'$\alpha_2^E$')
+
         ax4.set_xlabel(r'$\alpha$')
         ax4.set_title(r'Entry $w^E(\alpha)$: discrete vs analytical')
-        ax4.legend(fontsize=7)
+        ax4.legend(fontsize=6, ncol=2)
         ax4.grid(alpha=0.3)
+        # Set ylim to exclude boundary spike (last 1-2 grid points artifact)
+        all_wE = np.concatenate([ea['wE'], ea['w_incumbent']])
+        ylim_top = np.percentile(all_wE[all_wE > 0], 98) * 1.3 if np.any(all_wE > 0) else 1.0
+        ax4.set_ylim([0, max(ylim_top, 0.5)])
     else:
         ax4.set_visible(False)
 
@@ -1574,13 +1888,128 @@ def load_baseline_mat(mat_path=None):
 
 
 # =============================================================================
+# Convergence test: discrete vs analytical at different Delta
+# =============================================================================
+
+def convergence_test(deltas=None):
+    """Run discrete entry at several Delta values and compare to analytical.
+
+    The analytical result is Delta-independent (continuous limit).
+    If the discrete converges toward the analytical as Delta → 0,
+    the T^E formula is confirmed correct.
+    """
+    if deltas is None:
+        deltas = [0.004, 0.002, 0.001, 0.0005]
+
+    results = []
+    ana_WE = None
+
+    for delta in deltas:
+        print(f"\n{'='*60}")
+        print(f"  Delta = {delta}")
+        print(f"{'='*60}")
+
+        # Reset global state
+        g.__dict__.clear()
+
+        # Override Delta in run_baseline
+        run_baseline()
+        g.Delta = delta
+        # Rebuild almass/wmass at this Delta
+        almass_pts = np.arange(g.alpha0, g.alpha1, g.Delta)
+        if len(almass_pts) == 0:
+            almass_pts = np.array([g.alpha0])
+        w_at_almass = np.interp(almass_pts, g.baseline_alphas_fine,
+                                g.baseline_w_fine, left=0, right=0)
+        g.almass = almass_pts
+        g.wmass = w_at_almass * g.Delta
+
+        # Rebuild gfunprev/bfunprev
+        beta = g.beta
+        gd = gpriorfun(g.omvec).copy()
+        bd = bpriorfun(g.omvec).copy()
+        D_rp = _scalar(dfun(g.rp))
+        for k in range(len(g.almass)):
+            mask_g_k = g.omvec <= (beta + g.almass[k] * (1 - beta))
+            mask_b_k = g.omvec >= (1 - beta + g.almass[k] * beta)
+            raw_denom = (np.sum(g.delom * gd * mask_g_k) +
+                         np.sum(g.delom * bd * mask_b_k))
+            denom_k = raw_denom * D_rp
+            if denom_k > 0:
+                factor = g.wmass[k] / denom_k
+                gd = gd * (1 - mask_g_k * factor)
+                bd = bd * (1 - mask_b_k * factor)
+        g.gfunprev = gd
+        g.bfunprev = bd
+
+        cim_alpha = np.linspace(g.alpha1, g.alpha2, 100)
+        g.W = np.cumsum(np.concatenate([[g.WNS], g.wmass, wcim(cim_alpha)]))
+
+        # Run entry
+        almassE, wmassE, gammaE, WE = run_mainE()
+
+        WE_disc = np.sum(wmassE)
+        if g.entry_analytical is not None:
+            WE_ana = g.entry_analytical['WE_cumsum'][-1]
+            if ana_WE is None:
+                ana_WE = WE_ana
+        else:
+            WE_ana = None
+
+        results.append({
+            'delta': delta,
+            'WE_disc': WE_disc,
+            'WE_ana': WE_ana,
+            'rpE': g.rpE,
+            'alpha0E': g.alpha0E,
+            'alpha1E': g.alpha1E,
+        })
+
+    # Summary table
+    print(f"\n{'='*60}")
+    print("  CONVERGENCE TEST SUMMARY")
+    print(f"{'='*60}")
+    print(f"  {'Delta':>8s}  {'W^E disc':>12s}  {'W^E ana':>12s}  {'Diff':>12s}  {'Rel %':>8s}")
+    print(f"  {'-'*8}  {'-'*12}  {'-'*12}  {'-'*12}  {'-'*8}")
+    for r in results:
+        diff = r['WE_ana'] - r['WE_disc'] if r['WE_ana'] is not None else float('nan')
+        rel = 100 * diff / r['WE_ana'] if r['WE_ana'] and r['WE_ana'] > 0 else float('nan')
+        print(f"  {r['delta']:>8.4f}  {r['WE_disc']:>12.6f}  "
+              f"{r['WE_ana'] if r['WE_ana'] is not None else 'N/A':>12}  "
+              f"{diff:>12.6f}  {rel:>7.2f}%")
+    print(f"\n  Analytical W^E (Delta-independent) = {ana_WE:.6f}")
+
+    # Convergence plot
+    fig, ax = plt.subplots(figsize=(7, 4))
+    ds = [r['delta'] for r in results]
+    we_d = [r['WE_disc'] for r in results]
+    ax.plot(ds, we_d, 'ko-', lw=2, label='Discrete $W^E$')
+    if ana_WE is not None:
+        ax.axhline(ana_WE, color='b', ls='--', lw=1.5, label=f'Analytical $W^E$ = {ana_WE:.4f}')
+    ax.set_xlabel(r'$\Delta$')
+    ax.set_ylabel(r'$W^E$ (pooling region)')
+    ax.set_title('Convergence: Discrete → Analytical as $\\Delta \\to 0$')
+    ax.legend()
+    ax.grid(alpha=0.3)
+    ax.invert_xaxis()
+    plt.tight_layout()
+    plt.savefig('convergence_test.png', dpi=150)
+    plt.show()
+
+    return results
+
+
+# =============================================================================
 # Main execution
 # =============================================================================
 
 if __name__ == '__main__':
     import sys
-    if '--load-mat' in sys.argv:
+    if '--convergence' in sys.argv:
+        convergence_test()
+    elif '--load-mat' in sys.argv:
         load_baseline_mat()
+        almassE, wmassE, gammaE, WE = run_mainE()
     else:
         run_baseline()
-    almassE, wmassE, gammaE, WE = run_mainE()
+        almassE, wmassE, gammaE, WE = run_mainE()
