@@ -22,6 +22,22 @@ import warnings
 warnings.filterwarnings('ignore')
 
 
+# =============================================================================
+# Parameterization configs — switch ACTIVE_CONFIG to change parameters & cost fn
+# =============================================================================
+PARAM_CONFIGS = {
+    'original': {
+        'Pi': 0.2, 'beta': 0.5, 'BperG': 1.0,
+        'cfun': lambda alpha: 9.0 * alpha**2 + 0.2 * alpha,
+    },
+    'credit_model': {
+        'Pi': 0.05, 'beta': 0.1, 'BperG': 0.2197,
+        'cfun': lambda alpha: 0.2 * alpha**2 + 1.0 * alpha,
+    },
+}
+ACTIVE_CONFIG = 'original'  # switch here or set programmatically before calling run_baseline()
+
+
 def _scalar(x):
     """Convert any numpy scalar/0-d/1-element array to a Python float."""
     return np.asarray(x, dtype=float).item()
@@ -117,13 +133,21 @@ def dfuninv(d):
 
 
 def cfun(alpha):
-    """Cost function for incumbents. Matches cfun.m"""
+    """Cost function for incumbents. Dispatches to ACTIVE_CONFIG."""
     alpha = np.asarray(alpha, dtype=float)
-    Ca = 9.0   # was 9, this moves alphas a lot
-    Cb = 0.2
-    Cpower = 2.0  # it was 2
-    result = Ca * alpha**Cpower + Cb * alpha
+    result = PARAM_CONFIGS[ACTIVE_CONFIG]['cfun'](alpha)
+    result = np.asarray(result, dtype=float)
     return result.item() if np.size(result) == 1 else result
+
+
+def cfun_prime(alpha, eps=1e-6):
+    """First derivative of cost function (numerical, central differences)."""
+    return (cfun(alpha + eps) - cfun(alpha - eps)) / (2 * eps)
+
+
+def cfun_prime2(alpha, eps=1e-5):
+    """Second derivative of cost function (numerical, central differences)."""
+    return (cfun(alpha + eps) - 2 * cfun(alpha) + cfun(alpha - eps)) / (eps ** 2)
 
 
 # =============================================================================
@@ -177,11 +201,31 @@ def gamcplx(w):
 
 
 def NSfun(al):
-    """Non-selective entry function for incumbents. Matches NSfun.m"""
+    """Non-selective entry function for incumbents (squared residual). Matches NSfun.m"""
     al = _scalar(al)
     goodleftover = quad(gpriorfun_scalar, g.beta + al * (1 - g.beta), 1)[0]
     gammaNS = goodleftover / (goodleftover + g.badleftover)
     return (gammaNS * (1 + _scalar(cfun(al)) + g.Pi) - (1 + g.Pi))**2
+
+
+def NSfun_signed(al):
+    """Signed NS condition: gamma_NS*(1+K(alpha)) - (1+Pi). Zero at equilibrium."""
+    al = _scalar(al)
+    goodleftover = quad(gpriorfun_scalar, g.beta + al * (1 - g.beta), 1)[0]
+    if goodleftover + g.badleftover < 1e-12:
+        return -(1 + g.Pi)
+    gammaNS = goodleftover / (goodleftover + g.badleftover)
+    return gammaNS * (1 + _scalar(cfun(al)) + g.Pi) - (1 + g.Pi)
+
+
+def find_alpha2_mainE(alpha1, n_scan=500):
+    """Find smallest alpha2 > alpha1 satisfying the NS condition."""
+    als = np.linspace(alpha1 + 1e-4, 0.999, n_scan)
+    vals = np.array([NSfun_signed(a) for a in als])
+    for i in range(len(vals) - 1):
+        if vals[i] * vals[i + 1] < 0:
+            return brentq(lambda a: NSfun_signed(a), als[i], als[i + 1])
+    return None
 
 
 def gammaNSfun(al):
@@ -333,6 +377,11 @@ def cfunE(alpha):
         ca[i] = base_cost + distortion + addon
 
     return _scalar(ca[0]) if len(alpha) == 1 else ca
+
+
+def cfunE_prime(alpha, eps=1e-5):
+    """Numerical first derivative of entry cost function."""
+    return (_scalar(cfunE(alpha + eps)) - _scalar(cfunE(alpha - eps))) / (2 * eps)
 
 
 def gam0E(al, rpE, cum_gd=None, cum_bd=None):
@@ -587,20 +636,37 @@ def prof0Efun(r):
 # =============================================================================
 
 def run_baseline():
-    """Run the baseline model. Equivalent to main.m"""
+    """Run the baseline model using the analytical solver.
+
+    Replaces the older discrete iterative algorithm with the closed-form
+    analytical solution for Region I (same as credit_model.solve_nested_analytical).
+    Reconstructs discrete arrays (almass, wmass, gfunprev, bfunprev) so that
+    run_mainE() can consume them without changes.
+    """
     print("=" * 60)
-    print("Running baseline computation (main.m)")
+    print(f"Running baseline computation (analytical)  [config: {ACTIVE_CONFIG}]")
     print("=" * 60)
 
-    # Primitives — must match baseline.mat (Pi=0.2, beta=0.5)
-    g.Pi = 0.2
-    g.beta = 0.5
-    g.BperG = 1.0  # proportion of bad to good
+    # =====================================================================
+    # Parameters from active config
+    # =====================================================================
+    cfg = PARAM_CONFIGS[ACTIVE_CONFIG]
+    g.Pi = cfg['Pi']
+    g.beta = cfg['beta']
+    g.BperG = cfg['BperG']
+    beta = g.beta
 
-    # Finding alpha0 and rp
+    # Discretization (needed for run_mainE compatibility)
+    g.Delta = 0.001
+    g.delom = 0.0001
+    g.omvec = np.linspace(0, 1, int(round(1 / g.delom)))
+
+    # =====================================================================
+    # Find alpha0 and rp
+    # =====================================================================
     res = minimize_scalar(
         lambda alpha: (g.Pi + _scalar(cfun(alpha)) + 1) / gam0(alpha),
-        bounds=(0, 1), method='bounded'
+        bounds=(0.01, 0.99), method='bounded'
     )
     g.alpha0 = res.x
     g.rp = (g.Pi + _scalar(cfun(g.alpha0)) + 1) / gam0(g.alpha0) - 1
@@ -608,144 +674,298 @@ def run_baseline():
     print(f"  alpha0 = {g.alpha0:.6f}")
     print(f"  rp     = {g.rp:.6f}")
 
-    # Find alpha1
-    if (1 + g.rp) - 1 - _scalar(cfun(1.0)) > g.Pi:
+    # =====================================================================
+    # Find alpha1: where c(alpha1) + Pi = rp
+    # =====================================================================
+    if g.rp - _scalar(cfun(1.0)) > g.Pi:
         g.alpha1 = 1.0
     else:
-        g.alpha1 = fsolve(lambda alpha: _scalar(cfun(alpha)) - (g.rp - g.Pi), g.alpha0)[0]
+        g.alpha1 = brentq(lambda a: _scalar(cfun(a)) - (g.rp - g.Pi),
+                          0.01, 0.99)
 
     print(f"  alpha1 = {g.alpha1:.6f}")
 
-    # Discretization
-    g.Delta = 0.001
-    g.delom = 0.0001
-    g.omvec = np.linspace(0, 1, int(round(1 / g.delom)))
+    D_rp = _scalar(dfun(g.rp))
 
-    # Initialize distributions
-    g.gfunprev = gpriorfun(g.omvec).copy()
-    g.bfunprev = bpriorfun(g.omvec).copy()
+    # =====================================================================
+    # Region I: Analytical solution on a fine alpha grid
+    # =====================================================================
+    n_R1 = 2000
+    alphas = np.linspace(g.alpha0, g.alpha1, n_R1)
+    da = alphas[1] - alphas[0] if n_R1 > 1 else 1e-6
 
-    # Initialize mass points
-    almass_list = [g.alpha0]
-    wmass_list = []
+    # Thresholds
+    omega_g_vals = beta + alphas * (1 - beta)
+    omega_b_vals = 1 - beta + alphas * beta
 
-    wopt = 1.0
-    n = 2
+    # Prior-dependent inputs (uniform priors: g=1, b=BperG)
+    g_tilde = np.array([gpriorfun_scalar(og) for og in omega_g_vals])
+    b_tilde = np.array([bpriorfun_scalar(ob) for ob in omega_b_vals])
+    B0_tilde = np.array([quad(bpriorfun_scalar, ob, 1)[0]
+                         for ob in omega_b_vals])
 
-    # Store gnext, bnext
-    gnext = None
-    bnext = None
+    # Gamma(alpha) = (1 + K(alpha)) / (1 + rp) and its derivative
+    K_vals = np.array([_scalar(cfun(a)) for a in alphas]) + g.Pi
+    Gamma = (1 + K_vals) / (1 + g.rp)
+    Gamma_p = np.array([_scalar(cfun_prime(a)) for a in alphas]) / (1 + g.rp)
 
-    print("  Iterating through pooling region...")
+    one_minus_Gamma = 1 - Gamma
 
-    while almass_list[-1] + g.Delta <= g.alpha1:
-        if n >= 3:
-            g.gfunprev = gnext.copy()
-            g.bfunprev = bnext.copy()
+    # General T formula
+    denom_T = Gamma_p * B0_tilde - beta * b_tilde * Gamma * one_minus_Gamma
+    denom_T_safe = np.where(np.abs(denom_T) < 1e-15, 1e-15, denom_T)
+    T_vals = (1 - beta) * g_tilde * one_minus_Gamma * B0_tilde / denom_T_safe
 
-        alp = almass_list[-1]
-        g.alp = alp  # set global for gamcplx
+    # Derived quantities
+    G_vals = Gamma * T_vals
+    B_vals = one_minus_Gamma * T_vals
 
-        # Compute wmax: maximum w that keeps b non-negative
-        mask_g_alp = g.omvec <= (g.beta + alp * (1 - g.beta))
-        mask_b_alp = g.omvec >= (1 - g.beta + alp * g.beta)
-        denom_alp = (np.sum(g.delom * g.gfunprev[mask_g_alp]) +
-                     np.sum(g.delom * g.bfunprev[mask_b_alp]))
-        dfun_rp = _scalar(dfun(g.rp))
+    # Depletion factor E(alpha) = B(alpha) / B0_tilde(alpha)
+    E_vals = B_vals / np.where(np.abs(B0_tilde) < 1e-15, 1e-15, B0_tilde)
 
-        def bfunmin(w):
-            return np.min(g.bfunprev * (1 - mask_b_alp * w / denom_alp / dfun_rp))
+    # theta(alpha) = -d(ln E)/dalpha
+    ln_E = np.log(np.maximum(E_vals, 1e-30))
+    theta_vals = np.zeros_like(alphas)
+    theta_vals[1:-1] = -(ln_E[2:] - ln_E[:-2]) / (2 * da)
+    theta_vals[0] = -(ln_E[1] - ln_E[0]) / da
+    theta_vals[-1] = -(ln_E[-1] - ln_E[-2]) / da
 
-        wmax = fsolve(bfunmin, 1.0)[0]
+    # w(alpha) = theta * D(rp) * T
+    w_vals = theta_vals * D_rp * T_vals
+    w_vals = np.maximum(w_vals, 0)
 
-        # Try no-hole solution first
-        alopt3 = alp + g.Delta
-        res3 = minimize_scalar(
-            lambda w: 1000 * (profit(w, alopt3, alp) - (1 + g.Pi))**2,
-            bounds=(0, wmax), method='bounded'
-        )
-        wopt3 = res3.x
+    # Cumulative capital in Region I
+    W_cumsum_R1 = np.zeros_like(alphas)
+    W_cumsum_R1[1:] = np.cumsum(w_vals[:-1]) * da
 
-        res3b = minimize_scalar(
-            lambda alpha: 1000 * (_scalar(cfun(alpha)) - (1 + g.rp) * gamfun(wopt3, alpha, alp)),
-            bounds=(alp + g.Delta, g.alpha1), method='bounded'
-        )
-        alopt3b = res3b.x
+    print(f"  Region I capital = {W_cumsum_R1[-1]:.6f}")
 
-        if abs(alopt3 - alopt3b) < 10 * g.Delta:
-            wopt = wopt3
-            alopt = alopt3
-        else:
-            # Look for holes in support
-            res_w = minimize_scalar(
-                lambda w: 1000 * gamcplx(w),
-                bounds=(0, wmax), method='bounded'
-            )
-            wopt = res_w.x
+    # Store fine-grid baseline for use by entry analytical solver
+    g.baseline_alphas_fine = alphas.copy()
+    g.baseline_w_fine = w_vals.copy()
 
-            res_al = minimize_scalar(
-                lambda alpha: 1000 * (_scalar(cfun(alpha)) - (1 + g.rp) * gamfun(wopt, alpha, alp)),
-                bounds=(alp + g.Delta, g.alpha1), method='bounded'
-            )
-            alopt = res_al.x
+    # =====================================================================
+    # Leftover borrowers at end of Region I
+    # =====================================================================
+    # Good outside acceptance: integral of g from omega_g to 1
+    G_outside = np.array([quad(gpriorfun_scalar, og, 1)[0]
+                          for og in omega_g_vals])
+    G_leftover = G_vals + G_outside
 
-            # Try constrained optimization (fmincon equivalent)
-            res2 = minimize(
-                lambda w: 1000 * gamcplx(w[0]),
-                [wopt], bounds=[(0, wmax)], method='L-BFGS-B'
-            )
-            wopt2 = res2.x[0]
+    # Bad remaining
+    omega_b_0 = 1 - beta + g.alpha0 * beta
+    B_below_0 = quad(bpriorfun_scalar, 0, omega_b_0)[0]
+    b_tilde_E = b_tilde * E_vals * beta
+    B_dropouts = np.zeros_like(alphas)
+    B_dropouts[1:] = np.cumsum(b_tilde_E[:-1]) * da
+    B_leftover = B_below_0 + B_dropouts + B_vals
 
-            res_al2 = minimize_scalar(
-                lambda alpha: 1000 * (_scalar(cfun(alpha)) - (1 + g.rp) * gamfun(wopt2, alpha, alp)),
-                bounds=(alp + g.Delta, g.alpha1), method='bounded'
-            )
-            alopt2 = res_al2.x
+    g.badleftover = B_leftover[-1]
 
-            if abs(profit(wopt, alopt, alp) - (1 + g.Pi)) > abs(profit(wopt2, alopt2, alp) - (1 + g.Pi)):
-                wopt = wopt2
-                alopt = alopt2
-
-        almass_list.append(alopt)
-
-        # Update distributions
-        gnext = g.gfunprev * (1 - mask_g_alp * wopt / denom_alp / dfun_rp)
-        bnext = g.bfunprev * (1 - mask_b_alp * wopt / denom_alp / dfun_rp)
-
-        wmass_list.append(wopt)
-        n += 1
-
-        if n % 50 == 0:
-            print(f"    n={n}, alp={alp:.4f}")
-
-    # Finalize arrays
-    g.almass = np.array(almass_list)
-    g.wmass = np.array(wmass_list)
-
-    print(f"  Pooling region: {n-1} iterations")
-
-    # CIM and NS segment
-    g.badleftover = np.sum(g.delom * bnext)
-
-    # Find alpha2
-    res_a2 = minimize_scalar(lambda al: NSfun(al), bounds=(g.alpha1, 1), method='bounded')
-    g.alpha2 = res_a2.x
-
-    if NSfun(g.alpha2) < g.Delta:
+    # =====================================================================
+    # Find alpha2 and WNS (non-selective lenders)
+    # =====================================================================
+    alpha2_result = find_alpha2_mainE(g.alpha1)
+    if alpha2_result is not None:
+        g.alpha2 = alpha2_result
         g.WNS = _scalar(dfun(cfun(g.alpha2) + g.Pi)) * (
-            g.badleftover + quad(gpriorfun_scalar, g.beta + g.alpha2 * (1 - g.beta), 1)[0])
+            g.badleftover + quad(gpriorfun_scalar,
+                                 beta + g.alpha2 * (1 - beta), 1)[0])
     else:
         g.WNS = 0.0
         g.alpha2 = 1.0
 
-    # Cumulative wealth
+    # =====================================================================
+    # Cumulative wealth (Region I + Region II + NS)
+    # =====================================================================
+    cim_alpha = np.linspace(g.alpha1, g.alpha2, 100)
+    W_R2 = np.sum(wcim(cim_alpha))
+    g.W_total = W_cumsum_R1[-1] + W_R2 + g.WNS
+
+    # =====================================================================
+    # Reconstruct discrete arrays for run_mainE() compatibility
+    # =====================================================================
+    # almass: evenly spaced at Delta from alpha0 through alpha1
+    almass_pts = np.arange(g.alpha0, g.alpha1, g.Delta)
+    if len(almass_pts) == 0:
+        almass_pts = np.array([g.alpha0])
+
+    # wmass: interpolate analytical w density at almass points, convert to
+    # lending amount per step (density * Delta)
+    w_at_almass = np.interp(almass_pts, alphas, w_vals)
+    wmass_pts = w_at_almass * g.Delta
+
+    g.almass = almass_pts
+    g.wmass = wmass_pts
+
+    # Reconstruct gfunprev/bfunprev by running forward depletion on omega grid
+    gd = gpriorfun(g.omvec).copy()
+    bd = bpriorfun(g.omvec).copy()
+    dfun_rp = D_rp
+
+    for k in range(len(g.almass)):
+        mask_g_k = g.omvec <= (beta + g.almass[k] * (1 - beta))
+        mask_b_k = g.omvec >= (1 - beta + g.almass[k] * beta)
+        raw_denom = (np.sum(g.delom * gd * mask_g_k) +
+                     np.sum(g.delom * bd * mask_b_k))
+        denom_k = raw_denom * dfun_rp
+        if denom_k > 0:
+            factor = g.wmass[k] / denom_k
+            gd = gd * (1 - mask_g_k * factor)
+            bd = bd * (1 - mask_b_k * factor)
+
+    g.gfunprev = gd
+    g.bfunprev = bd
+
+    # Also store cumulative W vector (WNS + pooling + CIM) for compatibility
     cim_alpha = np.linspace(g.alpha1, g.alpha2, 100)
     g.W = np.cumsum(np.concatenate([[g.WNS], g.wmass, wcim(cim_alpha)]))
 
     print(f"  alpha2       = {g.alpha2:.6f}")
     print(f"  WNS          = {g.WNS:.6f}")
     print(f"  badleftover  = {g.badleftover:.6f}")
+    print(f"  W_total      = {g.W_total:.6f}")
     print("Baseline complete.\n")
+
+
+# =============================================================================
+# Analytical entry equilibrium — Region I (pooling)
+# =============================================================================
+
+def solve_entry_pooling_analytical(rpE, alpha0E, alpha1E, n_pts=500):
+    """
+    Analytical T^E construction for entry Region I (pooling).
+
+    Uses the same T-formula as the baseline analytical solver, but with
+    K^E(alpha) = PiE + cfunE(alpha) and entry rate rpE replacing K and rp.
+
+    The incumbent w(alpha) from the baseline is fixed. The entry density is:
+        w^E(alpha) = theta^E * D(rpE) * T^E(alpha) - w_incumbent(alpha)
+    Entry occurs only where w^E > 0.
+
+    Parameters
+    ----------
+    rpE : float — entry pooling rate
+    alpha0E : float — marginal entrant skill
+    alpha1E : float — upper boundary of entry pooling region
+    n_pts : int — grid points (default 500)
+
+    Returns
+    -------
+    dict with keys: alphas, wE, w_total, w_incumbent, TE, GE, BE, gammaE, da
+    """
+    beta = g.beta
+
+    alphas = np.linspace(alpha0E, alpha1E, n_pts)
+    da = alphas[1] - alphas[0] if n_pts > 1 else 1e-6
+
+    # Thresholds
+    omega_g_vals = beta + alphas * (1 - beta)
+    omega_b_vals = 1 - beta + alphas * beta
+
+    # Prior-dependent inputs (uniform priors)
+    g_tilde = np.array([gpriorfun_scalar(og) for og in omega_g_vals])
+    b_tilde = np.array([bpriorfun_scalar(ob) for ob in omega_b_vals])
+    B0_tilde = np.array([quad(bpriorfun_scalar, ob, 1)[0]
+                         for ob in omega_b_vals])
+
+    # K^E(alpha) = PiE + cfunE(alpha) and its derivative
+    print("  Computing cfunE on grid...")
+    KE = np.array([g.PiE + _scalar(cfunE(a)) for a in alphas])
+    print("  Computing cfunE derivative...")
+    KE_prime = np.array([cfunE_prime(a) for a in alphas])
+
+    # Effective range: only where KE < rpE (entry is profitable)
+    # Beyond this, the T^E formula gives negative/nonsensical values.
+    profitable = KE < rpE
+    if not np.any(profitable):
+        print("  WARNING: no profitable entry range (KE >= rpE everywhere)")
+        return {
+            'alphas': alphas, 'da': da, 'wE': np.zeros_like(alphas),
+            'w_total': np.zeros_like(alphas),
+            'w_incumbent': np.zeros_like(alphas),
+            'TE': np.zeros_like(alphas), 'GE': np.zeros_like(alphas),
+            'BE': np.zeros_like(alphas), 'EE': np.zeros_like(alphas),
+            'gammaE': np.ones_like(alphas), 'theta': np.zeros_like(alphas),
+            'KE': KE, 'KE_prime': KE_prime,
+            'WE_cumsum': np.zeros_like(alphas),
+        }
+
+    # T^E formula (eq. 4 from entry_Talpha_construction.tex)
+    num = (1 - beta) * g_tilde * (rpE - KE) * B0_tilde * (1 + rpE)
+    den = (KE_prime * B0_tilde * (1 + rpE)
+           - beta * b_tilde * (1 + KE) * (rpE - KE))
+    den_safe = np.where(np.abs(den) < 1e-15, 1e-15, den)
+    TE = num / den_safe
+
+    # Zero out T^E where KE >= rpE (not profitable)
+    TE = np.where(profitable, TE, 0.0)
+    TE = np.maximum(TE, 0.0)  # T is a mass, can't be negative
+
+    # Good/bad in acceptance region
+    GE = (1 + KE) / (1 + rpE) * TE
+    BE = (rpE - KE) / (1 + rpE) * TE
+    gammaE = np.where(TE > 1e-15, GE / TE, 1.0)
+
+    # Depletion factor
+    EE = BE / np.where(np.abs(B0_tilde) < 1e-15, 1e-15, B0_tilde)
+
+    # theta^E = -d(ln E^E)/dalpha  (same approach as baseline analytical solver)
+    # Note: the notes eq. (7) has a sign error in the B-based formula;
+    # using E = B/B0_tilde directly is equivalent and confirmed correct.
+    ln_EE = np.log(np.maximum(EE, 1e-30))
+    theta = np.zeros_like(alphas)
+    theta[1:-1] = -(ln_EE[2:] - ln_EE[:-2]) / (2 * da)
+    theta[0] = -(ln_EE[1] - ln_EE[0]) / da
+    theta[-1] = -(ln_EE[-1] - ln_EE[-2]) / da
+
+    # Total lending density in combined system
+    D_rpE = _scalar(dfun(rpE))
+    w_total = theta * D_rpE * TE
+    w_total = np.maximum(w_total, 0)
+
+    # Incumbent w at entry alphas (interpolated from baseline fine grid)
+    w_incumbent = np.interp(alphas, g.baseline_alphas_fine,
+                            g.baseline_w_fine, left=0, right=0)
+
+    # Entry density (ironed: entrants only where total exceeds incumbent)
+    wE = np.maximum(0, w_total - w_incumbent)
+
+    # Cumulative entry capital
+    WE_cumsum = np.zeros_like(alphas)
+    WE_cumsum[1:] = np.cumsum(wE[:-1]) * da
+
+    print(f"  Analytical entry: total W^E = {WE_cumsum[-1]:.6f}")
+
+    # Diagnostics
+    mid = n_pts // 2
+    print(f"  --- Diagnostics at alpha={alphas[mid]:.4f} (midpoint) ---")
+    print(f"    KE={KE[mid]:.4f}  KE'={KE_prime[mid]:.4f}  rpE-KE={rpE-KE[mid]:.4f}")
+    print(f"    TE={TE[mid]:.4f}  BE={BE[mid]:.4f}  EE={EE[mid]:.4f}")
+    print(f"    theta={theta[mid]:.4f}  D(rpE)={D_rpE:.4f}")
+    print(f"    w_total={w_total[mid]:.4f}  w_incumbent={w_incumbent[mid]:.4f}  wE={wE[mid]:.4f}")
+    print(f"  --- KE range: [{KE.min():.4f}, {KE.max():.4f}] ---")
+    print(f"  --- KE' range: [{KE_prime.min():.4f}, {KE_prime.max():.4f}] ---")
+    print(f"  --- TE range: [{TE.min():.4f}, {TE.max():.4f}] ---")
+    print(f"  --- w_total range: [{w_total.min():.4f}, {w_total.max():.4f}] ---")
+    print(f"  --- w_incumbent range: [{w_incumbent.min():.4f}, {w_incumbent.max():.4f}] ---")
+
+    return {
+        'alphas': alphas,
+        'da': da,
+        'wE': wE,
+        'w_total': w_total,
+        'w_incumbent': w_incumbent,
+        'TE': TE,
+        'GE': GE,
+        'BE': BE,
+        'EE': EE,
+        'gammaE': gammaE,
+        'theta': theta,
+        'KE': KE,
+        'KE_prime': KE_prime,
+        'WE_cumsum': WE_cumsum,
+    }
 
 
 # =============================================================================
@@ -1013,6 +1233,23 @@ def run_mainE():
 
     print(f"  badleftoverE = {g.badleftoverE:.6f}")
 
+    # ---------- Analytical entry comparison (Region I only) ----------
+    if g.rpE < g.rp:
+        print("\n  --- Analytical Entry (Region I) ---")
+        entry_ana = solve_entry_pooling_analytical(g.rpE, g.alpha0E, g.alpha1E)
+
+        # Compare total entry capital in pooling region
+        WE_disc = np.sum(wmassE)
+        WE_ana = entry_ana['WE_cumsum'][-1]
+        print(f"  Discrete  total W^E (pooling) = {WE_disc:.6f}")
+        print(f"  Analytical total W^E (pooling) = {WE_ana:.6f}")
+        print(f"  Difference = {WE_ana - WE_disc:.6f}")
+
+        # Store for later plotting
+        g.entry_analytical = entry_ana
+    else:
+        g.entry_analytical = None
+
     # ---------- Calculate non-selective and CIM ----------
     print("  Computing non-selective and CIM regions...")
 
@@ -1233,9 +1470,11 @@ def run_mainE():
     ax2.set_title('cumulative wealth')
 
     # Baseline cumulative wealth
-    x_base = np.concatenate([[0], g.almassshort[:-1],
+    x_base = np.concatenate([[0], g.almassshort,
                              np.linspace(g.alpha1, g.alpha2, 100)])
-    x_base = x_base[:len(g.W)]
+    # Trim or pad to match g.W length
+    n_W = len(g.W)
+    x_base = x_base[:n_W] if len(x_base) >= n_W else np.concatenate([x_base, np.full(n_W - len(x_base), x_base[-1])])
     ax2.scatter(x_base, g.W, s=3, c='r', label='incumbent')
     ax2.scatter(np.linspace(g.alpha2, 1, 10), g.W[-1] * np.ones(10), s=3, c='r')
     ax2.legend(fontsize=8)
@@ -1251,8 +1490,28 @@ def run_mainE():
     ax3.set_title(r'cost + $\Pi$')
     ax3.set_xlabel(r'$\alpha$')
 
-    # --- Subplot 4: (empty in original, was commented out) ---
-    axes[1, 1].set_visible(False)
+    # --- Subplot 4: Discrete vs Analytical entry w^E ---
+    ax4 = axes[1, 1]
+    if g.entry_analytical is not None:
+        ea = g.entry_analytical
+        # Analytical: w^E density
+        ax4.plot(ea['alphas'], ea['wE'], 'b-', lw=1.5, label='analytical $w^E$')
+        ax4.plot(ea['alphas'], ea['w_total'], 'g--', lw=1, alpha=0.6,
+                 label='analytical total')
+        ax4.plot(ea['alphas'], ea['w_incumbent'], 'r--', lw=1, alpha=0.6,
+                 label='incumbent $w$')
+        # Discrete: wmassE / Delta (convert mass to density)
+        disc_alphas = almassE[:-1] if len(almassE) > 1 else almassE
+        disc_density = wmassE / g.Delta if g.Delta > 0 else wmassE
+        if len(disc_alphas) == len(disc_density):
+            ax4.scatter(disc_alphas, disc_density, s=8, c='k', zorder=3,
+                        label='discrete $w^E/\\Delta$')
+        ax4.set_xlabel(r'$\alpha$')
+        ax4.set_title(r'Entry $w^E(\alpha)$: discrete vs analytical')
+        ax4.legend(fontsize=7)
+        ax4.grid(alpha=0.3)
+    else:
+        ax4.set_visible(False)
 
     plt.tight_layout()
     plt.savefig('mainE_results.png', dpi=150)
@@ -1320,8 +1579,8 @@ def load_baseline_mat(mat_path=None):
 
 if __name__ == '__main__':
     import sys
-    if '--recompute-baseline' in sys.argv:
-        run_baseline()
-    else:
+    if '--load-mat' in sys.argv:
         load_baseline_mat()
+    else:
+        run_baseline()
     almassE, wmassE, gammaE, WE = run_mainE()
