@@ -77,12 +77,16 @@ PARAM_CONFIGS = {
         'description': 'Figure 8 / fig:AIintermediateInnovation - big data: C^E<C for alpha>alpha_hat.',
         # Setup chosen so K^E starts above K (Π^E > Π = 0.2), is flatter at high
         # α (λ < 1 multiplicative reduction), and crosses K only at a relatively
-        # high α (within the CIM region, before NS).
+        # high α (around α ≈ 0.5, within the CIM region, before NS).
+        # alpha_hat = 0.55 puts the transition near the NS boundary; the crossover
+        # point K^E = K_inc then falls around α ≈ 0.5.
         **_DEFAULT_INC_BASELINE,
         'has_entry': True,
         'PiE': 0.5,
         'cfunE_kind': 'cost_reduction_top',
-        'cfunE_params': {'alpha_hat': 0.40, 'lambda': 0.5, 'transition_width': 0.05},
+        'cfunE_params': {'alpha_hat': 0.55, 'lambda': 0.5, 'transition_width': 0.08},
+        # transition_width = 0.08 keeps K^E monotone given C(α)=9α²+0.2α.
+        # The bound is s ≥ (1-λ)·C(α_hat)/[(2+2λ)·C'(α_hat)] ≈ 0.047.
     },
     'FIG9_OB_limited': {
         'description': 'Figure 9a / fig:OB left - Open Banking, limited adoption (alpha_hat small).',
@@ -102,19 +106,31 @@ PARAM_CONFIGS = {
         # Target equilibrium branch: rprime is min AND rprime > K(α₂)
         # ("rNS goes up, no NS entry" branch from prop:EntEqHeterogC proof,
         # lines 1432-1433 of the LaTeX).
-        # The Gaussian dip is centered inside the pooling region, away from α₀,
-        # so entrants prefer to enter at HIGHER α than incumbents → more cream-
-        # skimming of goods → more bads left over → rprime > K(α₂).
-        # K^E ≥ K_inc at α=0 and α=α₂ ensures rdprime, rtprime are not the min.
+        # The Gaussian dip is centered closer to α₁ with a deeper dip and a
+        # higher baseline, so:
+        #   (a) entrants prefer α near α_center > α₀ → more cream-skimming of
+        #       goods → larger badleftoverE → r_NS^E visibly above r_NS.
+        #   (b) K^E rises above K_inc cleanly outside the band (delta_baseline)
+        #       so rdprime, rtprime are not the minimum.
         **_DEFAULT_INC_BASELINE,
         'has_entry': True,
         'PiE': 0.2,
         'cfunE_kind': 'cost_dip_gaussian',
         'cfunE_params': {
-            'alpha_center': 0.20,    # in middle of pooling region [α₀=0.054, α₁=0.346]
-            'sigma': 0.08,           # narrow band
-            'delta_dip': 0.20,       # peak advantage
-            'delta_baseline': 0.05,  # entrant slightly disadvantaged outside the band
+            # Three constraints to balance:
+            #   (i)   K^E monotone:  delta_dip ≤ K'(α_c−σ)·σ/0.607.
+            #   (ii)  K^E ≥ K_inc in Region II (α₁,α₂):
+            #         delta_baseline ≥ delta_dip · exp(−(α₁−α_c)²/(2σ²)).
+            #   (iii) Enough dip and high enough α_c so entrants enter at
+            #         mid-pooling and cream-skim → badleftoverE > badleftover.
+            # K'(α)=18α+0.2.  Picking α_c=0.25, σ=0.05:
+            #   (i)  K'(0.20)·0.05/0.607 ≈ 3.8·0.082 = 0.313  ⇒ dip ≤ 0.31.
+            #   (ii) bump(α₁=0.346) = exp(−(0.096)²/0.005)=0.158, so
+            #         baseline ≥ 0.30·0.158 = 0.047  ⇒ baseline = 0.10 safe.
+            'alpha_center': 0.25,
+            'sigma': 0.05,
+            'delta_dip': 0.30,
+            'delta_baseline': 0.10,
         },
     },
 }

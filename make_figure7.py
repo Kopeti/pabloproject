@@ -34,14 +34,14 @@ def main():
     ax.set_title('Interest-rate schedule'); ax.grid(alpha=0.3); ax.legend(fontsize=9)
 
     # --- Panel 2: K(alpha) ---
-    # K_SP is independent of PiE, so the two SP curves coincide — show one.
+    # K^E = Π^E + C^E_SP = K_SP(α; κ) is independent of Π^E by construction,
+    # so the high-/low-Π^E entry K curves coincide. Plot one of them.
     ax = axes[1]
     ax.plot(incumbent['alphas_plot'], incumbent['K_inc_plot'],
             'g--', lw=2, label=r'$K(\alpha) = \Pi + C(\alpha)$ (incumbent)')
     ax.plot(sp_highPiE['alphas_plot'], sp_highPiE['K_E_plot'],
-            'b-',  lw=2, label=r'$K^E(\alpha) = \Pi^E_{high} + C^E_{SP}(\alpha)$')
-    ax.plot(sp_lowPiE['alphas_plot'],  sp_lowPiE['K_E_plot'],
-            'r-',  lw=2, label=r'$K^E(\alpha) = \Pi^E_{low} + C^E_{SP}(\alpha)$')
+            'b-',  lw=2,
+            label=r'$K^E(\alpha) = K_{SP}(\alpha;\kappa)$ (entrant, both $\Pi^E$)')
     ax.set_xlabel(r'$\alpha$'); ax.set_ylabel(r'$K(\alpha)$')
     ax.set_title('Modified cost'); ax.grid(alpha=0.3); ax.legend(fontsize=9)
 
