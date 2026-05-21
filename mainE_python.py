@@ -75,11 +75,14 @@ PARAM_CONFIGS = {
     },
     'FIG8_bigdata': {
         'description': 'Figure 8 / fig:AIintermediateInnovation - big data: C^E<C for alpha>alpha_hat.',
+        # Setup chosen so K^E starts above K (Π^E > Π = 0.2), is flatter at high
+        # α (λ < 1 multiplicative reduction), and crosses K only at a relatively
+        # high α (within the CIM region, before NS).
         **_DEFAULT_INC_BASELINE,
         'has_entry': True,
-        'PiE': 0.1,
+        'PiE': 0.5,
         'cfunE_kind': 'cost_reduction_top',
-        'cfunE_params': {'alpha_hat': 0.4, 'lambda': 0.7},
+        'cfunE_params': {'alpha_hat': 0.40, 'lambda': 0.5, 'transition_width': 0.05},
     },
     'FIG9_OB_limited': {
         'description': 'Figure 9a / fig:OB left - Open Banking, limited adoption (alpha_hat small).',
@@ -95,12 +98,24 @@ PARAM_CONFIGS = {
                          'use_legacy_addons': True, 'kappa1_distortion': -4.0},
     },
     'FIG9_OB_broad': {
-        'description': 'Figure 9b / fig:OB right - Open Banking, broad adoption (alpha_hat intermediate).',
+        'description': 'Figure 9b / fig:OB right - Open Banking, broad adoption (cost advantage band at intermediate alpha).',
+        # Target equilibrium branch: rprime is min AND rprime > K(α₂)
+        # ("rNS goes up, no NS entry" branch from prop:EntEqHeterogC proof,
+        # lines 1432-1433 of the LaTeX).
+        # The Gaussian dip is centered inside the pooling region, away from α₀,
+        # so entrants prefer to enter at HIGHER α than incumbents → more cream-
+        # skimming of goods → more bads left over → rprime > K(α₂).
+        # K^E ≥ K_inc at α=0 and α=α₂ ensures rdprime, rtprime are not the min.
         **_DEFAULT_INC_BASELINE,
         'has_entry': True,
-        'PiE': 0.1,
-        'cfunE_kind': 'cost_reduction_low',
-        'cfunE_params': {'alpha_hat': 0.3, 'lambda': 0.6},
+        'PiE': 0.2,
+        'cfunE_kind': 'cost_dip_gaussian',
+        'cfunE_params': {
+            'alpha_center': 0.20,    # in middle of pooling region [α₀=0.054, α₁=0.346]
+            'sigma': 0.08,           # narrow band
+            'delta_dip': 0.20,       # peak advantage
+            'delta_baseline': 0.05,  # entrant slightly disadvantaged outside the band
+        },
     },
 }
 
@@ -231,7 +246,8 @@ def _resolve_cfunE_mode(cfg):
     if kind == 'polynomial':
         return 'simple', params
 
-    if kind in ('cost_reduction_top', 'cost_reduction_low'):
+    if kind in ('cost_reduction_top', 'cost_reduction_low',
+                'cost_offset_smooth', 'cost_dip_gaussian'):
         # New kinds — handled directly in cfunE, no legacy mode.
         return kind, params
 
@@ -525,22 +541,63 @@ def cfunE(alpha):
     cfg = PARAM_CONFIGS[ACTIVE_CONFIG]
     mode, params = _resolve_cfunE_mode(cfg)
 
-    # --- cost-reduction kinds: piecewise λ·C(α).
-    # cfunE returns C^E(α). Downstream uses K^E = Π^E + cfunE(α).
-    if mode == 'cost_reduction_top':
+    # --- cost-reduction kinds: smooth sigmoid-windowed C^E(α) = w(α)·C(α).
+    # The sigmoid window gives a C¹ transition through α̂, eliminating the kink
+    # that bare piecewise functions would introduce.  Steepness s controls how
+    # sharp the transition is (s small ≈ piecewise; s large ≈ broad ramp).
+    # cfunE returns C^E(α); downstream uses K^E = Π^E + cfunE(α).
+    if mode in ('cost_reduction_top', 'cost_reduction_low'):
         alpha_arr = np.atleast_1d(np.asarray(alpha, dtype=float))
         alpha_hat = params['alpha_hat']
         lam = params['lambda']
+        s = params.get('transition_width', 0.03)
         c_inc = np.array([_scalar(cfun(a)) for a in alpha_arr])
-        ca = np.where(alpha_arr > alpha_hat, lam * c_inc, c_inc)
+        sig = 1.0 / (1.0 + np.exp(-(alpha_arr - alpha_hat) / s))
+        if mode == 'cost_reduction_top':
+            # w: 1 (low α) → λ (high α).
+            w = 1.0 - (1.0 - lam) * sig
+        else:
+            # w: λ (low α) → 1 (high α).
+            w = lam + (1.0 - lam) * sig
+        ca = w * c_inc
         return _scalar(ca[0]) if len(alpha_arr) == 1 else ca
 
-    if mode == 'cost_reduction_low':
+    # --- cost_offset_smooth: additive offset that is negative at low α and
+    # positive at high α, transitioning through α̂.
+    # K^E(α) - K(α) = (Π^E - Π) + offset(α), where
+    #   offset(α) = -δ_low + (δ_low + δ_high)·sigmoid((α - α̂)/s)
+    # At low α: offset = -δ_low (entrant cheaper).
+    # At high α: offset = +δ_high (entrant more expensive).
+    if mode == 'cost_offset_smooth':
         alpha_arr = np.atleast_1d(np.asarray(alpha, dtype=float))
         alpha_hat = params['alpha_hat']
-        lam = params['lambda']
+        delta_low = params['delta_low']
+        delta_high = params['delta_high']
+        s = params.get('transition_width', 0.03)
         c_inc = np.array([_scalar(cfun(a)) for a in alpha_arr])
-        ca = np.where(alpha_arr < alpha_hat, lam * c_inc, c_inc)
+        sig = 1.0 / (1.0 + np.exp(-(alpha_arr - alpha_hat) / s))
+        offset = -delta_low + (delta_low + delta_high) * sig
+        ca = c_inc + offset
+        return _scalar(ca[0]) if len(alpha_arr) == 1 else ca
+
+    # --- cost_dip_gaussian: a Gaussian-shaped cost ADVANTAGE band centered at
+    # alpha_center, with a baseline disadvantage delta_baseline elsewhere.
+    # C^E(α) = C(α) + delta_baseline - delta_dip · exp(-(α-α_c)²/(2σ²))
+    # At α far from α_c: K^E ≈ K + delta_baseline (entrant slightly more expensive).
+    # At α = α_c: K^E ≈ K + delta_baseline - delta_dip (entrant cheaper if dip>baseline).
+    # This gives a "bump-down" shape: cost advantage in an intermediate band, no
+    # advantage at very low/high α.  Used for OB-broad to make entrants prefer
+    # higher α (mid-pooling) than α₀, which produces extra cream-skimming.
+    if mode == 'cost_dip_gaussian':
+        alpha_arr = np.atleast_1d(np.asarray(alpha, dtype=float))
+        alpha_center = params['alpha_center']
+        sigma = params['sigma']
+        delta_dip = params['delta_dip']
+        delta_baseline = params.get('delta_baseline', 0.0)
+        c_inc = np.array([_scalar(cfun(a)) for a in alpha_arr])
+        bump = np.exp(-(alpha_arr - alpha_center)**2 / (2.0 * sigma**2))
+        offset = delta_baseline - delta_dip * bump
+        ca = c_inc + offset
         return _scalar(ca[0]) if len(alpha_arr) == 1 else ca
 
     # --- polynomial closed form ---
@@ -1516,6 +1573,15 @@ def run_mainE():
 
     print(f"  Pooling region: {n-1} iterations")
 
+    # Guard: if loop didn't execute (degenerate/empty pooling region), keep the
+    # initial distributions so downstream code has valid arrays to work with.
+    # This case arises when K^E is high enough that entrants don't pool but may
+    # still enter in CIM/NS regions (e.g., Big Data with Π^E > Π).
+    if gnext_E is None:
+        gnext_E = gfunprevE.copy()
+        bnext_E = bfunprevE.copy()
+        print("  [empty pooling region: skipping selective pooling entry]")
+
     # Final gammaE
     if gnext_E is not None:
         mask_gf = g.omvec <= (g.beta + g.alpha1E * (1 - g.beta))
@@ -1543,7 +1609,9 @@ def run_mainE():
     print(f"  badleftoverE = {g.badleftoverE:.6f}")
 
     # ---------- Analytical entry comparison (Region I only) ----------
-    if g.rpE < g.rp:
+    # Skip if pooling region is degenerate (α₀^E ≥ α₁^E - Δ).
+    pooling_is_valid = (g.rpE < g.rp) and (g.alpha1E - g.alpha0E > g.Delta * 2)
+    if pooling_is_valid:
         print("\n  --- Analytical Entry (Region I) ---")
         cfg = PARAM_CONFIGS[ACTIVE_CONFIG]
         mode, _ = _resolve_cfunE_mode(cfg)
