@@ -24,45 +24,88 @@ warnings.filterwarnings('ignore')
 
 
 # =============================================================================
-# Parameterization configs — switch ACTIVE_CONFIG to change parameters & cost fn
+# Parameterization configs — one per panel of Figures 7-9 in the paper.
+# Switch ACTIVE_CONFIG (or pass --config <name>) to change parameters and cost.
+#
+# Schema per config:
+#   description : str
+#   Pi, beta, BperG : incumbent baseline scalars
+#   cfun            : incumbent cost function (callable α -> cost)
+#   has_entry       : bool — if False, skip the entry-equilibrium solve
+#   PiE             : entry capital cost (if has_entry)
+#   cfunE_kind      : one of
+#                       'selection_preserving' — SP form (γ-dependent), per Def. SPK
+#                       'polynomial'           — closed-form polynomial
+#                       'cost_reduction_top'   — C^E(α) = C(α) for α≤α̂, λ·C(α) for α>α̂
+#                       'cost_reduction_low'   — C^E(α) = λ·C(α) for α<α̂, C(α) for α≥α̂
+#   cfunE_params    : dict — kind-specific parameters
+#                       SP:   {'kappa': 1.1, 'use_smoothing': True,
+#                              'use_legacy_addons': False, 'kappa1_distortion': 0.0}
+#                       poly: {'coeffs': lambda α -> cost}
+#                       cost_reduction_*: {'alpha_hat': 0.3, 'lambda': 0.7}
 # =============================================================================
+_DEFAULT_INC_BASELINE = dict(
+    Pi=0.2, beta=0.5, BperG=1.0,
+    cfun=lambda alpha: 9.0 * alpha**2 + 0.2 * alpha,
+)
+
 PARAM_CONFIGS = {
-    'original': {
-        'Pi': 0.2, 'beta': 0.5, 'BperG': 1.0,
-        'cfun': lambda alpha: 9.0 * alpha**2 + 0.2 * alpha,
-        # Entry parameters
-        'PiE': 0.1, 'kappa1': -4.0,
-        'cfunE_mode': 'complex',  # 'complex' = original MATLAB cfunE, 'simple' = polynomial
-        'cfunE_simple': None,     # set below if cfunE_mode == 'simple'
-        'cfunE_eps': 0.0,         # regularization eps (only for 'smooth')
+    'FIG7_incumbent': {
+        'description': 'Figure 7 / fig:SPT - incumbent only (green dashed curve).',
+        **_DEFAULT_INC_BASELINE,
+        'has_entry': False,
     },
-    'smooth_entry': {
-        'Pi': 0.2, 'beta': 0.5, 'BperG': 1.0,
-        'cfun': lambda alpha: 9.0 * alpha**2 + 0.2 * alpha,
-        # Same as original but cfunE uses PCHIP interpolant (monotone, smooth)
-        'PiE': 0.1, 'kappa1': -4.0,
-        'cfunE_mode': 'smooth',
-        'cfunE_simple': None,
-        'cfunE_eps': 0.0,
+    'FIG7_SP_highPiE': {
+        'description': 'Figure 7 / fig:SPT - SP entry with PiE > PiE_bar (blue, no Region IIb).',
+        **_DEFAULT_INC_BASELINE,
+        'has_entry': True,
+        'PiE': 0.15,
+        'cfunE_kind': 'selection_preserving',
+        'cfunE_params': {'kappa': 1.1, 'use_smoothing': True,
+                         'use_legacy_addons': False, 'kappa1_distortion': 0.0},
     },
-    'simple_entry': {
-        'Pi': 0.2, 'beta': 0.5, 'BperG': 1.0,
-        'cfun': lambda alpha: 9.0 * alpha**2 + 0.2 * alpha,
-        # Entry: same incumbent cost shape but shifted down for entrant advantage
-        'PiE': 0.1, 'kappa1': 0.0,
-        'cfunE_mode': 'simple',
-        'cfunE_simple': lambda alpha: 7.0 * alpha**2 + 0.15 * alpha,
-        'cfunE_eps': 0.0,
+    'FIG7_SP_lowPiE': {
+        'description': 'Figure 7 / fig:SPT - SP entry with PiE < PiE_bar (red, Region IIb present).',
+        **_DEFAULT_INC_BASELINE,
+        'has_entry': True,
+        'PiE': 0.05,
+        'cfunE_kind': 'selection_preserving',
+        'cfunE_params': {'kappa': 1.1, 'use_smoothing': True,
+                         'use_legacy_addons': False, 'kappa1_distortion': 0.0},
     },
-    'credit_model': {
-        'Pi': 0.05, 'beta': 0.1, 'BperG': 0.2197,
-        'cfun': lambda alpha: 0.2 * alpha**2 + 1.0 * alpha,
-        'PiE': 0.1, 'kappa1': -4.0,
-        'cfunE_mode': 'complex',
-        'cfunE_simple': None,
+    'FIG8_bigdata': {
+        'description': 'Figure 8 / fig:AIintermediateInnovation - big data: C^E<C for alpha>alpha_hat.',
+        **_DEFAULT_INC_BASELINE,
+        'has_entry': True,
+        'PiE': 0.1,
+        'cfunE_kind': 'cost_reduction_top',
+        'cfunE_params': {'alpha_hat': 0.4, 'lambda': 0.7},
+    },
+    'FIG9_OB_limited': {
+        'description': 'Figure 9a / fig:OB left - Open Banking, limited adoption (alpha_hat small).',
+        # Calibration starting point: matches the previously-active "smooth_entry"
+        # parametrization, which has been calibrated to look like fig:OB left.
+        # In the legacy code this used the SP form + addons; this config replicates
+        # that exactly. Iteration may replace it with a clean cost_reduction_low.
+        **_DEFAULT_INC_BASELINE,
+        'has_entry': True,
+        'PiE': 0.1,
+        'cfunE_kind': 'selection_preserving',
+        'cfunE_params': {'kappa': 1.1, 'use_smoothing': True,
+                         'use_legacy_addons': True, 'kappa1_distortion': -4.0},
+    },
+    'FIG9_OB_broad': {
+        'description': 'Figure 9b / fig:OB right - Open Banking, broad adoption (alpha_hat intermediate).',
+        **_DEFAULT_INC_BASELINE,
+        'has_entry': True,
+        'PiE': 0.1,
+        'cfunE_kind': 'cost_reduction_low',
+        'cfunE_params': {'alpha_hat': 0.3, 'lambda': 0.6},
     },
 }
-ACTIVE_CONFIG = 'smooth_entry'  # switch here or set programmatically before calling run_baseline()
+
+# Default config for direct execution; can be overridden by --config CLI flag.
+ACTIVE_CONFIG = 'FIG9_OB_limited'
 
 
 def _scalar(x):
@@ -165,6 +208,34 @@ def cfun(alpha):
     result = PARAM_CONFIGS[ACTIVE_CONFIG]['cfun'](alpha)
     result = np.asarray(result, dtype=float)
     return result.item() if np.size(result) == 1 else result
+
+
+def _resolve_cfunE_mode(cfg):
+    """Map new cfunE_kind to the legacy cfunE_mode used internally.
+
+    This is a temporary bridge while we keep the existing 'smooth'/'complex'
+    code paths working. Once the cost_reduction_* and clean selection_preserving
+    paths are validated end-to-end, the legacy mode strings can be retired.
+    """
+    kind = cfg.get('cfunE_kind')
+    params = cfg.get('cfunE_params', {})
+
+    if kind is None:
+        # Legacy-style flat config; fall back to whatever cfunE_mode says.
+        return cfg.get('cfunE_mode', 'complex'), params
+
+    if kind == 'selection_preserving':
+        # Routes through the SP form (γ-dependent). Smoothing optional.
+        return ('smooth' if params.get('use_smoothing', True) else 'complex'), params
+
+    if kind == 'polynomial':
+        return 'simple', params
+
+    if kind in ('cost_reduction_top', 'cost_reduction_low'):
+        # New kinds — handled directly in cfunE, no legacy mode.
+        return kind, params
+
+    raise ValueError(f"Unknown cfunE_kind: {kind!r}")
 
 
 def cfun_prime(alpha, eps=1e-6):
@@ -390,9 +461,14 @@ def _build_cfunE_pchip():
     grid = np.concatenate([grid_left, [maxa - 1e-6], grid_right])
     grid.sort()
 
+    cfg = PARAM_CONFIGS[ACTIVE_CONFIG]
+    _, params = _resolve_cfunE_mode(cfg)
+    kappa = params.get('kappa', 1.1)
+    use_legacy_addons = params.get('use_legacy_addons', False)
+    kappa1_dist = params.get('kappa1_distortion', 0.0)
+
     alpha1 = g.alpha1
     maxc = 100.0
-    kappa = 1.1
     alphabar = (g.alpha0 + g.alpha1) / 2.0
 
     # Evaluate each component separately
@@ -404,13 +480,14 @@ def _build_cfunE_pchip():
         gu = _scalar(gammaupdate2(a, g.alpha0, g.rp))
         inner_r = (g.Pi + 1 + _scalar(cfun(a))) / gu - 1
         base_costs[i] = gu * (1 + _scalar(dfuninv(kappa * _scalar(dfun(inner_r))))) - (1 + g.PiE)
-        distortions[i] = g.kappa1 * a * (a - alphabar)
-        if a < alpha1:
-            addons[i] = 0.1 * min(0.1 * (1.0 / max(alpha1 - a, 1e-6) - 1.0 / alpha1), maxc)
-        elif a > alpha1:
-            addons[i] = 0.1 * (maxc + (a - alpha1))
-        else:
-            addons[i] = 0.1 * maxc
+        if use_legacy_addons:
+            distortions[i] = kappa1_dist * a * (a - alphabar)
+            if a < alpha1:
+                addons[i] = 0.1 * min(0.1 * (1.0 / max(alpha1 - a, 1e-6) - 1.0 / alpha1), maxc)
+            elif a > alpha1:
+                addons[i] = 0.1 * (maxc + (a - alpha1))
+            else:
+                addons[i] = 0.1 * maxc
 
     # Smooth base_cost: this is the noisy component (from discrete omega grid).
     # Savitzky-Golay: polynomial degree 3, window ~5% of grid points.
@@ -436,22 +513,46 @@ def _build_cfunE_pchip():
 
 def cfunE(alpha):
     """
-    Entry cost function for new entrants.
+    Entry cost function for new entrants. Dispatches by cfunE_kind.
 
-    Modes:
-      'simple'  — smooth polynomial from PARAM_CONFIGS.
-      'complex' — original MATLAB cfunE.m (singular 1/(maxa-a) addon).
-      'smooth'  — PCHIP interpolant of complex cfunE: preserves values,
-                   monotone, smooth derivatives everywhere.
+    Kinds (new schema):
+      'selection_preserving' — SP form per Def. SPK: γ(α)(1+D⁻¹((1/κ)D((1+K)/γ-1))) - 1 - Π^E.
+                               Params: kappa, use_smoothing, use_legacy_addons, kappa1_distortion.
+      'polynomial'           — polynomial closed form. Params: coeffs (callable).
+      'cost_reduction_top'   — C^E(α)=C(α) for α≤α̂, λ·C(α) for α>α̂. Params: alpha_hat, lambda.
+      'cost_reduction_low'   — C^E(α)=λ·C(α) for α<α̂, C(α) for α≥α̂. Params: alpha_hat, lambda.
     """
     cfg = PARAM_CONFIGS[ACTIVE_CONFIG]
+    mode, params = _resolve_cfunE_mode(cfg)
 
-    if cfg['cfunE_mode'] == 'simple':
+    # --- cost-reduction kinds: piecewise λ·C(α).
+    # cfunE returns C^E(α). Downstream uses K^E = Π^E + cfunE(α).
+    if mode == 'cost_reduction_top':
         alpha_arr = np.atleast_1d(np.asarray(alpha, dtype=float))
-        ca = cfg['cfunE_simple'](alpha_arr)
+        alpha_hat = params['alpha_hat']
+        lam = params['lambda']
+        c_inc = np.array([_scalar(cfun(a)) for a in alpha_arr])
+        ca = np.where(alpha_arr > alpha_hat, lam * c_inc, c_inc)
         return _scalar(ca[0]) if len(alpha_arr) == 1 else ca
 
-    if cfg['cfunE_mode'] == 'smooth':
+    if mode == 'cost_reduction_low':
+        alpha_arr = np.atleast_1d(np.asarray(alpha, dtype=float))
+        alpha_hat = params['alpha_hat']
+        lam = params['lambda']
+        c_inc = np.array([_scalar(cfun(a)) for a in alpha_arr])
+        ca = np.where(alpha_arr < alpha_hat, lam * c_inc, c_inc)
+        return _scalar(ca[0]) if len(alpha_arr) == 1 else ca
+
+    # --- polynomial closed form ---
+    if mode == 'simple':
+        alpha_arr = np.atleast_1d(np.asarray(alpha, dtype=float))
+        poly = params.get('coeffs') if params else cfg.get('cfunE_simple')
+        if poly is None:
+            raise ValueError("polynomial cfunE_kind requires 'coeffs' callable in cfunE_params")
+        ca = poly(alpha_arr)
+        return _scalar(ca[0]) if len(alpha_arr) == 1 else ca
+
+    if mode == 'smooth':
         # Use PCHIP interpolant (built once, cached on g)
         if not hasattr(g, '_cfunE_pchip') or g._cfunE_pchip is None:
             _build_cfunE_pchip()
@@ -459,13 +560,15 @@ def cfunE(alpha):
         ca = g._cfunE_pchip(alpha_arr)
         return _scalar(ca[0]) if len(alpha_arr) == 1 else ca
 
-    # --- Complex mode (original MATLAB cfunE) ---
+    # --- Complex mode (canonical SP form, optionally with legacy addons) ---
     alpha = np.atleast_1d(np.asarray(alpha, dtype=float))
     ca = np.zeros(len(alpha))
 
+    kappa = params.get('kappa', 1.1)
+    use_legacy_addons = params.get('use_legacy_addons', False)
+    kappa1_dist = params.get('kappa1_distortion', 0.0)
     maxa = g.alpha1
     maxc = 100.0
-    kappa = 1.1
     alphabar = (g.alpha0 + g.alpha1) / 2.0
 
     for i in range(len(alpha)):
@@ -473,20 +576,20 @@ def cfunE(alpha):
         gu = gammaupdate2(a, g.alpha0, g.rp)
         gu = _scalar(gu)
 
-        # Base cost from incumbent equivalent
+        # Canonical SP base cost: γ(α)(1+D⁻¹((1/κ)D((1+K)/γ-1))) - 1 - Π^E
+        # NOTE the code uses `kappa * dfun(inner_r)` which equals (1/κ_paper)·D(·)
+        # when the code's kappa equals 1/κ_paper.  Convention preserved from MATLAB.
         inner_r = (g.Pi + 1 + _scalar(cfun(a))) / gu - 1
         base_cost = gu * (1 + _scalar(dfuninv(kappa * _scalar(dfun(inner_r))))) - (1 + g.PiE)
 
-        # Distortion term
-        distortion = g.kappa1 * a * (a - alphabar)
-
-        # Nonlinear add-on (matches the boolean*min(...) pattern from MATLAB)
-        if a < maxa:
-            addon = 0.1 * min(0.1 * (1.0 / (maxa - a) - 1.0 / maxa), maxc)
-        elif a > maxa:
-            addon = 0.1 * (maxc + (a - maxa))
-        else:
-            addon = 0.0
+        addon = 0.0
+        distortion = 0.0
+        if use_legacy_addons:
+            distortion = kappa1_dist * a * (a - alphabar)
+            if a < maxa:
+                addon = 0.1 * min(0.1 * (1.0 / (maxa - a) - 1.0 / maxa), maxc)
+            elif a > maxa:
+                addon = 0.1 * (maxc + (a - maxa))
 
         ca[i] = base_cost + distortion + addon
 
@@ -495,9 +598,10 @@ def cfunE(alpha):
 
 def cfunE_prime(alpha, eps=1e-5):
     """First derivative of entry cost function.
-    Uses PCHIP analytical derivative for smooth mode, numerical otherwise."""
+    Uses PCHIP analytical derivative for smooth (SP) mode, numerical otherwise."""
     cfg = PARAM_CONFIGS[ACTIVE_CONFIG]
-    if cfg['cfunE_mode'] == 'smooth' and hasattr(g, '_cfunE_pchip') and g._cfunE_pchip is not None:
+    mode, _ = _resolve_cfunE_mode(cfg)
+    if mode == 'smooth' and hasattr(g, '_cfunE_pchip') and g._cfunE_pchip is not None:
         return _scalar(g._cfunE_pchip(np.atleast_1d(alpha), 1)[0])
     return (_scalar(cfunE(alpha + eps)) - _scalar(cfunE(alpha - eps))) / (2 * eps)
 
@@ -858,9 +962,14 @@ def run_baseline():
 
     print(f"  Region I capital = {W_cumsum_R1[-1]:.6f}")
 
-    # Store fine-grid baseline for use by entry analytical solver
+    # Store fine-grid baseline for use by entry analytical solver and SP cost
     g.baseline_alphas_fine = alphas.copy()
     g.baseline_w_fine = w_vals.copy()
+    g.gamma_inc_fine = Gamma.copy()  # γ(α, 1, r_p) on the Region-I fine grid
+
+    # Build a PCHIP interpolant for γ_inc(α). Used by the canonical SP cost.
+    from scipy.interpolate import PchipInterpolator
+    g.gamma_inc_interp = PchipInterpolator(alphas, Gamma, extrapolate=True)
 
     # =====================================================================
     # Leftover borrowers at end of Region I
@@ -1175,7 +1284,11 @@ def run_mainE():
 
     # ---------- Settings ----------
     cfg = PARAM_CONFIGS[ACTIVE_CONFIG]
-    g.kappa1 = cfg.get('kappa1', -4.0)
+    _, _cfunE_params = _resolve_cfunE_mode(cfg)
+    # kappa1 is the legacy distortion coefficient; only used by SP w/ legacy addons.
+    # Defaults to 0 for any kind that doesn't use it; preserved as g.kappa1 because
+    # filename templates downstream interpolate it.
+    g.kappa1 = _cfunE_params.get('kappa1_distortion', cfg.get('kappa1', 0.0))
     g.PiE = cfg.get('PiE', 0.1)
 
     print(f"  kappa1 = {g.kappa1}")
@@ -1433,8 +1546,9 @@ def run_mainE():
     if g.rpE < g.rp:
         print("\n  --- Analytical Entry (Region I) ---")
         cfg = PARAM_CONFIGS[ACTIVE_CONFIG]
+        mode, _ = _resolve_cfunE_mode(cfg)
 
-        if cfg['cfunE_mode'] == 'simple':
+        if mode == 'simple':
             # cfunE is already a smooth polynomial — no spline needed.
             # Run analytical with raw cfunE directly (it IS smooth).
             print("  [Simple cfunE — no spline needed]")
@@ -2046,6 +2160,82 @@ def convergence_test(deltas=None):
 
 
 # =============================================================================
+# Public API for figure-driver scripts
+# =============================================================================
+
+def solve_for_config(name):
+    """Run incumbent (and entry, if configured) solve for a named config.
+
+    Returns a dict with everything the figure-driver scripts need to plot:
+      'config'       : the config dict
+      'alpha0', 'alpha1', 'alpha2' : incumbent skill thresholds
+      'rp'           : Region-I pooling rate
+      'alphas_fine'  : fine α grid in Region I
+      'w_inc_fine'   : incumbent entry density on the fine grid
+      'gamma_inc'    : γ(α, 1, rp) on the fine grid
+      'K_inc_fine'   : K(α) = Π + C(α) on the fine grid
+      'has_entry'    : bool — whether the entry block was solved
+      Entry-only (present when has_entry is True):
+        'alpha0E', 'alpha1E', 'alpha2E', 'rpE', 'rnsE'
+        'K_E_fine' : K^E(α) = Π^E + C^E(α) on the fine grid
+        'wE'       : entry mass profile (from discrete solve)
+        'almassE'  : α-grid for the discrete entry solve
+    """
+    global ACTIVE_CONFIG
+    ACTIVE_CONFIG = name
+    cfg = PARAM_CONFIGS[name]
+
+    # Reset cached PCHIP interpolants between configs
+    g._cfunE_pchip = None
+
+    run_baseline()
+    alphas_plot = np.linspace(0.0, 1.0, 1000)
+    r_inc_plot = rfun(alphas_plot, g.alpha0, g.alpha1, g.alpha2)
+    K_inc_fine = np.array([_scalar(cfun(a)) for a in g.baseline_alphas_fine]) + g.Pi
+    K_inc_plot = np.array([_scalar(cfun(a)) for a in alphas_plot]) + g.Pi
+
+    result = {
+        'config': cfg,
+        'config_name': name,
+        'alpha0': g.alpha0,
+        'alpha1': g.alpha1,
+        'alpha2': g.alpha2,
+        'rp': g.rp,
+        'rNS_inc': _scalar(cfun(g.alpha2)) + g.Pi if g.alpha2 < 1 else None,
+        'alphas_fine': g.baseline_alphas_fine.copy(),
+        'w_inc_fine': g.baseline_w_fine.copy(),
+        'gamma_inc': g.gamma_inc_fine.copy(),
+        'K_inc_fine': K_inc_fine,
+        'alphas_plot': alphas_plot,
+        'r_inc_plot': r_inc_plot,
+        'K_inc_plot': K_inc_plot,
+        'has_entry': cfg.get('has_entry', True),
+    }
+
+    if cfg.get('has_entry', True):
+        almassE, wmassE, gammaE, WE = run_mainE()
+        K_E_fine = np.array([_scalar(cfunE(a)) for a in g.baseline_alphas_fine]) + g.PiE
+        K_E_plot = np.array([_scalar(cfunE(a)) for a in alphas_plot]) + g.PiE
+        r_E_plot = rfunE(alphas_plot, min(g.alpha0, g.alpha0E), g.alpha1E, g.alpha2E)
+        result.update({
+            'alpha0E': g.alpha0E,
+            'alpha1E': g.alpha1E,
+            'alpha2E': getattr(g, 'alpha2E', None),
+            'rpE': g.rpE,
+            'rnsE': getattr(g, 'rnsE', None),
+            'K_E_fine': K_E_fine,
+            'K_E_plot': K_E_plot,
+            'r_E_plot': r_E_plot,
+            'almassE': almassE,
+            'wE': wmassE,
+            'gammaE': gammaE,
+            'WE': WE,
+            'PiE': g.PiE,
+        })
+    return result
+
+
+# =============================================================================
 # Main execution
 # =============================================================================
 
@@ -2057,5 +2247,20 @@ if __name__ == '__main__':
         load_baseline_mat()
         almassE, wmassE, gammaE, WE = run_mainE()
     else:
+        # Allow --config <name> to override the default ACTIVE_CONFIG.
+        if '--config' in sys.argv:
+            idx = sys.argv.index('--config')
+            if idx + 1 >= len(sys.argv):
+                raise SystemExit("--config requires a config name")
+            ACTIVE_CONFIG = sys.argv[idx + 1]
+            if ACTIVE_CONFIG not in PARAM_CONFIGS:
+                raise SystemExit(
+                    f"Unknown config {ACTIVE_CONFIG!r}. "
+                    f"Available: {list(PARAM_CONFIGS.keys())}")
+            print(f"Using config: {ACTIVE_CONFIG}")
+            print(f"  {PARAM_CONFIGS[ACTIVE_CONFIG]['description']}")
         run_baseline()
-        almassE, wmassE, gammaE, WE = run_mainE()
+        if PARAM_CONFIGS[ACTIVE_CONFIG].get('has_entry', True):
+            almassE, wmassE, gammaE, WE = run_mainE()
+        else:
+            print("[has_entry=False — skipping entry-equilibrium solve]")
