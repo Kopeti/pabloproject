@@ -12,6 +12,7 @@ Usage:
 Dependencies: numpy, scipy, matplotlib
 """
 
+import os
 import numpy as np
 from scipy.optimize import minimize_scalar, fsolve, minimize, brentq
 from scipy.integrate import quad
@@ -1535,7 +1536,7 @@ def run_mainE():
 
     elif rdprime == min_r:
         if rdprime > _scalar(cfun(g.alpha2)) + g.Pi:
-            g.rnsE = rprime
+            g.rnsE = rdprime
             g.alpha2E = g.alpha2
             print('  >> rNS goes up with NS entry')
         else:
@@ -1573,6 +1574,7 @@ def run_mainE():
             if WNSE_val > g.WNS:
                 g.alpha2E = alpha2E0
                 g.rnsE = _scalar(rtildeafunE(g.alpha2, g.alpha2E))
+                WNSE = WNSE_val - g.WNS  # atom of entrant NS capital at rtilde(alpha2)
                 print('  >> NS rate goes down, with NS entry before alpha2')
             else:
                 print('  >> we are on a branch which we guessed did not exist')
@@ -1628,7 +1630,8 @@ def run_mainE():
 
     # ---------- Cumulative wealth ----------
     cim_alphasE = np.linspace(g.alpha1E, g.alpha2E, 100)
-    WE = np.cumsum(np.concatenate([[WNSE], wmassE, wcimE(cim_alphasE)]))
+    # WE = selective entry only (pooling + CIM); WNSE added as jump at alpha=0
+    WE = np.cumsum(np.concatenate([wmassE, wcimE(cim_alphasE)]))
 
     # ---------- Save info ----------
     if g.badleftover < g.badleftoverE:
@@ -1681,17 +1684,30 @@ def run_mainE():
 
     # --- Subplot 2: Cumulative wealth ---
     ax2 = axes[0, 1]
-    welength = len(WE) - len(almassE[:-1]) - 1
-    x_new = np.concatenate([[0], almassE[:-1],
+    WE_total = WNSE + WE[-1]  # total entry capital including NS atom
+
+    # Jump at alpha=0 for WNSE (non-selective entrants, alpha=0)
+    if WNSE > 0:
+        ax2.plot([0, 0], [0, WNSE], 'k-', lw=2)
+        ax2.plot(0, 0, 'ko', markersize=6, markerfacecolor='white', markeredgewidth=1.5)
+        ax2.plot(0, WNSE, 'ko', markersize=6, markerfacecolor='black',
+                 label='NS entry (discrete)')
+    # Flat from 0 to alpha0E at WNSE level
+    alpha_flat_E = np.linspace(0, g.alpha0E, 20)
+    ax2.plot(alpha_flat_E, WNSE * np.ones_like(alpha_flat_E), 'k-', lw=1)
+
+    # Selective entry: pooling + CIM (offset by WNSE)
+    welength = len(WE) - len(almassE[:-1])  # = len(cim_alphasE)
+    x_new = np.concatenate([almassE[:-1],
                             np.linspace(g.alpha1E, g.alpha2E, max(welength, 1))])
     # Trim or extend to match WE length
     if len(x_new) < len(WE):
         x_new = np.concatenate([x_new, np.linspace(g.alpha2E, 1, len(WE) - len(x_new))])
     x_new = x_new[:len(WE)]
 
-    ax2.scatter(x_new, WE, s=5, c='k', zorder=3, label='discrete entry')
+    ax2.scatter(x_new, WNSE + WE, s=5, c='k', zorder=3, label='discrete entry')
     # Extend flat to the right
-    ax2.scatter(np.linspace(g.alpha2E, 1, 100), WE[-1] * np.ones(100), s=5, c='k')
+    ax2.scatter(np.linspace(g.alpha2E, 1, 100), WE_total * np.ones(100), s=5, c='k')
     ax2.set_ylim([0, 1.5])
 
     # Analytical cumulative entry wealth (Region I + CIM + NS)
@@ -1717,12 +1733,12 @@ def run_mainE():
             cim_ana_al = np.array([g.alpha1E])
             WE_cim_cumsum = np.array([WE_R1_total])
 
-        # NS entry (already computed in discrete code as WNSE)
+        # NS entry at alpha=0 (offset for analytical curve)
         WE_ana_total = WE_cim_cumsum[-1] + WNSE
 
-        # Plot: Region I + CIM + NS as one continuous line
+        # Plot: WNSE offset + Region I + CIM as one continuous line
         ana_alphas = np.concatenate([ea['alphas'], cim_ana_al])
-        ana_cumsum = np.concatenate([ea['WE_cumsum'], WE_cim_cumsum])
+        ana_cumsum = WNSE + np.concatenate([ea['WE_cumsum'], WE_cim_cumsum])
         ax2.plot(ana_alphas, ana_cumsum, 'b-', lw=2, label='analytical entry')
         # Flat extension after alpha2E
         ax2.plot([g.alpha2E, 1.0], [WE_ana_total, WE_ana_total], 'b-', lw=2)
@@ -1801,20 +1817,30 @@ def run_mainE():
             if np.any(wE_cim > 0):
                 ax4.plot(cim_entry_al, wE_cim, 'b-', lw=1, alpha=0.7)
 
+        # WNSE atom at alpha=0 (all non-selectives have precision 0;
+        # the phi calculation determines how this capital is allocated
+        # across markets, but the lenders themselves sit at alpha=0)
+        if WNSE > 0:
+            ax4.plot([0, 0], [0, WNSE], 'g-', lw=2)
+            ax4.plot(0, WNSE, 'go', markersize=8,
+                     markerfacecolor='green', markeredgewidth=2,
+                     label=f'NS entry = {WNSE:.4f}')
+            ax4.plot(0, 0, 'go', markersize=8,
+                     markerfacecolor='white', markeredgewidth=2)
+
         # Discrete: wmassE / Delta (convert mass to density)
         disc_alphas = almassE[:-1] if len(almassE) > 1 else almassE
         disc_density = wmassE / g.Delta if g.Delta > 0 else wmassE
         if len(disc_alphas) == len(disc_density):
             ax4.scatter(disc_alphas, disc_density, s=8, c='k', zorder=3,
                         label='discrete $w^E/\\Delta$')
-        # Baseline thresholds
-        ax4.axvline(g.alpha0, color='red', ls=':', lw=0.8, label=r'$\alpha_0$')
-        ax4.axvline(g.alpha1, color='red', ls='--', lw=0.8, label=r'$\alpha_1$')
-        ax4.axvline(g.alpha2, color='red', ls='-.', lw=0.8, label=r'$\alpha_2$')
-        # Entry thresholds
-        ax4.axvline(g.alpha0E, color='blue', ls=':', lw=0.8, label=r'$\alpha_0^E$')
-        ax4.axvline(g.alpha1E, color='blue', ls='--', lw=0.8, label=r'$\alpha_1^E$')
-        ax4.axvline(g.alpha2E, color='blue', ls='-.', lw=0.8, label=r'$\alpha_2^E$')
+        # Threshold lines (no legend labels)
+        ax4.axvline(g.alpha0, color='red', ls=':', lw=0.8, alpha=0.5)
+        ax4.axvline(g.alpha1, color='red', ls=':', lw=0.8, alpha=0.5)
+        ax4.axvline(g.alpha2, color='red', ls=':', lw=0.8, alpha=0.5)
+        ax4.axvline(g.alpha0E, color='blue', ls=':', lw=0.8, alpha=0.5)
+        ax4.axvline(g.alpha1E, color='blue', ls=':', lw=0.8, alpha=0.5)
+        ax4.axvline(g.alpha2E, color='blue', ls=':', lw=0.8, alpha=0.5)
 
         ax4.set_xlabel(r'$\alpha$')
         ax4.set_title(r'Entry $w^E(\alpha)$: discrete vs analytical')
@@ -1824,12 +1850,32 @@ def run_mainE():
         all_wE = np.concatenate([ea['wE'], ea['w_incumbent']])
         ylim_top = np.percentile(all_wE[all_wE > 0], 98) * 1.3 if np.any(all_wE > 0) else 1.0
         ax4.set_ylim([0, max(ylim_top, 0.5)])
+
+        # Threshold text labels at top of panel
+        yl = ax4.get_ylim()
+        yt = yl[1] - 0.02 * (yl[1] - yl[0])
+        nudge = 0.008
+        ax4.text(g.alpha0 + nudge, yt, r'$\alpha_0$', ha='left', va='top',
+                 fontsize=8, color='red')
+        ax4.text(g.alpha1 + nudge, yt, r'$\alpha_1$', ha='left', va='top',
+                 fontsize=8, color='red')
+        ax4.text(g.alpha2 + nudge, yt, r'$\alpha_2$', ha='left', va='top',
+                 fontsize=8, color='red')
+        ax4.text(g.alpha0E - nudge, yt, r'$\alpha_0^E$', ha='right', va='top',
+                 fontsize=8, color='blue')
+        ax4.text(g.alpha1E - nudge, yt, r'$\alpha_1^E$', ha='right', va='top',
+                 fontsize=8, color='blue')
+        ax4.text(g.alpha2E - nudge, yt, r'$\alpha_2^E$', ha='right', va='top',
+                 fontsize=8, color='blue')
     else:
         ax4.set_visible(False)
 
     plt.tight_layout()
-    plt.savefig('mainE_results.png', dpi=150)
-    plt.show()
+    _script_dir = os.path.dirname(os.path.abspath(__file__))
+    _fig_path = os.path.join(_script_dir, 'mainE_results.png')
+    plt.savefig(_fig_path, dpi=150)
+    print(f"  Figure saved to {_fig_path}")
+    plt.close(fig)
 
     print("\nEntry computation complete.")
     return almassE, wmassE, gammaE, WE
@@ -1994,7 +2040,7 @@ def convergence_test(deltas=None):
     ax.invert_xaxis()
     plt.tight_layout()
     plt.savefig('convergence_test.png', dpi=150)
-    plt.show()
+    plt.close()
 
     return results
 

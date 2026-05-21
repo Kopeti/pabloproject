@@ -1,6 +1,6 @@
 """
 Generate the paper figure (fig:nested-vs-iid) with only the analytical nested
-solution (labelled "Nested") and IID. No discrete comparison curves.
+solution (labelled "Nested") and Ind Inf. No discrete comparison curves.
 
 Saves to: Peter-Pablo-Maryam/figures/credit_model.png
 """
@@ -16,7 +16,7 @@ from credit_model import (
 )
 
 def plot_paper_figure(params, nested, iid):
-    """Plot nested vs IID comparison without discrete curves."""
+    """Plot nested vs Ind Inf comparison without discrete curves."""
     fig, axes = plt.subplots(2, 2, figsize=(12, 10))
 
     alpha0 = nested['alpha0']
@@ -39,7 +39,7 @@ def plot_paper_figure(params, nested, iid):
     axes[0,0].plot(alpha_r1, r_r1, 'b-', lw=2, label='Nested')
     axes[0,0].plot(alpha_r2, r_r2, 'b-', lw=2)
     axes[0,0].plot(0, r_NS, 'bo', markersize=10, markerfacecolor='blue', label='Nested (non-selective)')
-    axes[0,0].plot(iid['alpha_eq'], iid['r_eq'], 'r-', lw=2, label='IID')
+    axes[0,0].plot(iid['alpha_eq'], iid['r_eq'], 'r-', lw=2, label='Ind Inf')
 
     # Average interest rate for good borrowers
     avg_r_nested, avg_r_iid, _, _ = compute_avg_good_rate(params, nested, iid)
@@ -48,7 +48,7 @@ def plot_paper_figure(params, nested, iid):
     # Labels near right edge of panel
     axes[0,0].text(0.9, avg_r_nested + 0.02, f'Nested avg = {avg_r_nested:.3f}', fontsize=7,
                    color='blue', ha='center', va='bottom')
-    axes[0,0].text(0.9, avg_r_iid - 0.02, f'IID avg = {avg_r_iid:.3f}', fontsize=7,
+    axes[0,0].text(0.9, avg_r_iid - 0.02, f'Ind Inf avg = {avg_r_iid:.3f}', fontsize=7,
                    color='red', ha='center', va='top')
 
     axes[0,0].axvline(alpha0, color='black', ls=':', alpha=0.3)
@@ -68,7 +68,7 @@ def plot_paper_figure(params, nested, iid):
     # =====================================================================
     axes[0,1].plot(nested['alphas_R1'], nested['gammas_R1'], 'b-', lw=2, label='Nested')
     axes[0,1].plot(nested['alphas_R2'], nested['gammas_R2'], 'b-', lw=2)
-    axes[0,1].plot(iid['alpha_eq'], iid['gamma_eq'], 'r-', lw=2, label='IID')
+    axes[0,1].plot(iid['alpha_eq'], iid['gamma_eq'], 'r-', lw=2, label='Ind Inf')
     # Non-selective lender gamma at alpha=0
     goodleft = nested.get('goodleftover_alpha2', 0)
     badleft = nested['badleftover']
@@ -99,9 +99,9 @@ def plot_paper_figure(params, nested, iid):
     # Region II
     axes[1,0].plot(nested['alphas_R2'], WNS + nested['W_R2_cumsum'], 'b-', lw=2)
 
-    # IID
+    # Ind Inf
     alpha_before_iid = np.linspace(0, iid['alpha0'], 20)
-    axes[1,0].plot(alpha_before_iid, np.zeros_like(alpha_before_iid), 'r-', lw=2, label='IID')
+    axes[1,0].plot(alpha_before_iid, np.zeros_like(alpha_before_iid), 'r-', lw=2, label='Ind Inf')
     axes[1,0].plot(iid['alpha_eq'], iid['W_cumsum'], 'r-', lw=2)
 
     axes[1,0].axvline(alpha0, color='black', ls=':', alpha=0.3)
@@ -120,8 +120,8 @@ def plot_paper_figure(params, nested, iid):
     axes[1,1].plot(nested['alphas_R1'], nested['BLOs_R1'], 'b--', lw=2, label='Nested B')
     axes[1,1].plot(nested['alphas_R2'], nested['GLOs_R2'], 'b-', lw=2)
     axes[1,1].plot(nested['alphas_R2'], nested['BLOs_R2'], 'b--', lw=2)
-    axes[1,1].plot(iid['alpha_eq'], iid['G_eq'], 'r-', lw=2, label='IID G')
-    axes[1,1].plot(iid['alpha_eq'], iid['B_eq'], 'r--', lw=2, label='IID B')
+    axes[1,1].plot(iid['alpha_eq'], iid['G_eq'], 'r-', lw=2, label='Ind Inf G')
+    axes[1,1].plot(iid['alpha_eq'], iid['B_eq'], 'r--', lw=2, label='Ind Inf B')
 
     # Nested: remaining masses at alpha2, cleared by NS lenders (drop to 0)
     G_rem_a2 = nested['GLOs_R2'][-1]
@@ -135,7 +135,7 @@ def plot_paper_figure(params, nested, iid):
     axes[1,1].plot(alpha2, B_rem_a2, 'bo', markersize=8, markerfacecolor='blue', markeredgewidth=2)
     axes[1,1].plot(alpha2, 0, 'bo', markersize=8, markerfacecolor='white', markeredgewidth=2)
 
-    # IID: good borrowers clear at alpha_bar; bad remain unserved
+    # Ind Inf: good borrowers clear at alpha_bar; bad remain unserved
     alpha_bar = iid['alpha_bar']
     G_rem_iid = iid['G_eq'][-1]
     axes[1,1].plot(alpha_bar, G_rem_iid, 'ro', markersize=8, markerfacecolor='red', markeredgewidth=2)
@@ -170,7 +170,7 @@ def plot_paper_figure(params, nested, iid):
     print(f"\n  [Caption quantities]")
     print(f"    Nested: remaining G at alpha2 = {G_rem_nested_a2:.3f}, remaining B at alpha2 = {B_rem_nested_a2:.3f}")
     print(f"    These are served at the non-selective rate r_NS = {r_NS:.4f}")
-    print(f"    IID: unserved bad at alpha=1 (dashed red) = {B_rem_iid:.3f}")
+    print(f"    Ind Inf: unserved bad at alpha=1 (dashed red) = {B_rem_iid:.3f}")
 
     return fig
 
@@ -182,7 +182,7 @@ if __name__ == "__main__":
     nested = solve_nested_analytical(params)
     print(f"  alpha0={nested['alpha0']:.4f}, alpha1={nested['alpha1']:.4f}, alpha2={nested['alpha2']:.4f}, rp={nested['rp']:.4f}")
 
-    print("Solving IID...")
+    print("Solving Ind Inf...")
     iid = solve_iid(params)
     print(f"  alpha0={iid['alpha0']:.4f}, alpha_bar={iid['alpha_bar']:.4f}, r0={iid['r0']:.4f}")
 
@@ -192,6 +192,6 @@ if __name__ == "__main__":
     fig = plot_paper_figure(params, nested, iid)
 
     # Save to paper figures directory
-    output_path = r"d:\Dropbox\projects-Dropbox\The-pablo-project\Peter-Pablo-Maryam\figures\credit_model.png"
+    output_path = r"c:\Dropbox\projects-Dropbox\The-pablo-project\Peter-Pablo-Maryam\figures\credit_model.png"
     fig.savefig(output_path, dpi=150, bbox_inches='tight')
     print(f"Figure saved to {output_path}")
