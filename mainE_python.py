@@ -89,17 +89,23 @@ PARAM_CONFIGS = {
         # The bound is s ≥ (1-λ)·C(α_hat)/[(2+2λ)·C'(α_hat)] ≈ 0.047.
     },
     'FIG9_OB_limited': {
-        'description': 'Figure 9a / fig:OB left - Open Banking, limited adoption (alpha_hat small).',
-        # Calibration starting point: matches the previously-active "smooth_entry"
-        # parametrization, which has been calibrated to look like fig:OB left.
-        # In the legacy code this used the SP form + addons; this config replicates
-        # that exactly. Iteration may replace it with a clean cost_reduction_low.
+        'description': 'Figure 9a / fig:OB left - Open Banking, limited adoption (cost advantage at low alpha).',
+        # Clean cost_offset_smooth replacing the legacy SP+addon hack.
+        # Offset is negative at low alpha (entrant cheaper -> pooling and NS
+        # entry, rate goes down) and modestly positive at high alpha (entrant
+        # slightly above incumbent K -> no CIM entry, K^E close to K_inc).
+        # The sigmoid offset is monotone-increasing so K^E remains monotone
+        # by construction (no slope constraint needed).
         **_DEFAULT_INC_BASELINE,
         'has_entry': True,
-        'PiE': 0.1,
-        'cfunE_kind': 'selection_preserving',
-        'cfunE_params': {'kappa': 1.1, 'use_smoothing': True,
-                         'use_legacy_addons': True, 'kappa1_distortion': -4.0},
+        'PiE': 0.2,                  # same as Pi; NS entry advantage comes from the offset
+        'cfunE_kind': 'cost_offset_smooth',
+        'cfunE_params': {
+            'alpha_hat': 0.18,        # transition centered in lower half of pooling
+            'delta_low': 0.10,        # entrant K below incumbent K by ~0.10 at low alpha
+            'delta_high': 0.05,       # entrant K above incumbent K by 0.05 at high alpha
+            'transition_width': 0.04,
+        },
     },
     'FIG9_OB_broad': {
         'description': 'Figure 9b / fig:OB right - Open Banking, broad adoption (cost advantage band at intermediate alpha).',
