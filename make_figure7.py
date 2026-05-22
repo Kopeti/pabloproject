@@ -22,11 +22,11 @@ def main():
 
     # --- Panel 1: r(alpha) ---
     ax = axes[0]
-    ax.plot(incumbent['alphas_plot'], incumbent['r_inc_plot'],
+    ax.plot(incumbent['r_inc_alphas'], incumbent['r_inc_plot'],
             'g--', lw=2, label='incumbent')
-    ax.plot(sp_highPiE['alphas_plot'], sp_highPiE['r_E_plot'],
+    ax.plot(sp_highPiE['r_E_alphas'], sp_highPiE['r_E_plot'],
             'b-',  lw=2, label=r'SP entry, $\Pi^E > \bar\Pi^E$')
-    ax.plot(sp_lowPiE['alphas_plot'],  sp_lowPiE['r_E_plot'],
+    ax.plot(sp_lowPiE['r_E_alphas'],  sp_lowPiE['r_E_plot'],
             'r-',  lw=2, label=r'SP entry, $\Pi^E < \bar\Pi^E$')
     for cfg, color in [(incumbent, 'g'), (sp_highPiE, 'b'), (sp_lowPiE, 'r')]:
         ax.axvline(cfg['alpha0'], color=color, ls=':', lw=0.5, alpha=0.5)

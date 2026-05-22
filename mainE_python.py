@@ -2247,6 +2247,30 @@ def convergence_test(deltas=None):
 # Public API for figure-driver scripts
 # =============================================================================
 
+def _build_rate_curve_piecewise(rate_fn, alpha0, alpha1, alpha2, n=400):
+    """Construct a rate curve r(α) with NaN sentinels at each discontinuity.
+
+    Returns (alphas, rates) where matplotlib will draw separate segments for
+    Region I (pooling, [α₀, α₁)), Region II (CIM, [α₁, α₂)), and Region III
+    (NS, [α₂, 1]), separated by NaN gaps at α₁ and α₂.
+
+    rate_fn(alpha_array, alpha0, alpha1, alpha2) — vectorized rate function
+    matching the rfun / rfunE signature.
+    """
+    eps = 1e-6
+    # Three segments, each sampled densely; NaN sentinels between them.
+    seg1_a = np.linspace(alpha0, alpha1 - eps, max(2, int(n * (alpha1 - alpha0))))
+    seg2_a = np.linspace(alpha1, alpha2 - eps, max(2, int(n * (alpha2 - alpha1))))
+    seg3_a = np.linspace(alpha2, 1.0, max(2, int(n * (1.0 - alpha2))))
+    seg1_r = rate_fn(seg1_a, alpha0, alpha1, alpha2)
+    seg2_r = rate_fn(seg2_a, alpha0, alpha1, alpha2)
+    seg3_r = rate_fn(seg3_a, alpha0, alpha1, alpha2)
+    nan = np.array([np.nan])
+    alphas = np.concatenate([seg1_a, nan, seg2_a, nan, seg3_a])
+    rates = np.concatenate([seg1_r, nan, seg2_r, nan, seg3_r])
+    return alphas, rates
+
+
 def solve_for_config(name):
     """Run incumbent (and entry, if configured) solve for a named config.
 
@@ -2274,7 +2298,9 @@ def solve_for_config(name):
 
     run_baseline()
     alphas_plot = np.linspace(0.0, 1.0, 1000)
-    r_inc_plot = rfun(alphas_plot, g.alpha0, g.alpha1, g.alpha2)
+    # Build the incumbent rate curve piecewise with NaN gaps at α₁ and α₂.
+    r_inc_alphas, r_inc_plot = _build_rate_curve_piecewise(
+        rfun, g.alpha0, g.alpha1, g.alpha2)
     K_inc_fine = np.array([_scalar(cfun(a)) for a in g.baseline_alphas_fine]) + g.Pi
     K_inc_plot = np.array([_scalar(cfun(a)) for a in alphas_plot]) + g.Pi
 
@@ -2291,6 +2317,7 @@ def solve_for_config(name):
         'gamma_inc': g.gamma_inc_fine.copy(),
         'K_inc_fine': K_inc_fine,
         'alphas_plot': alphas_plot,
+        'r_inc_alphas': r_inc_alphas,
         'r_inc_plot': r_inc_plot,
         'K_inc_plot': K_inc_plot,
         'has_entry': cfg.get('has_entry', True),
@@ -2300,7 +2327,8 @@ def solve_for_config(name):
         almassE, wmassE, gammaE, WE = run_mainE()
         K_E_fine = np.array([_scalar(cfunE(a)) for a in g.baseline_alphas_fine]) + g.PiE
         K_E_plot = np.array([_scalar(cfunE(a)) for a in alphas_plot]) + g.PiE
-        r_E_plot = rfunE(alphas_plot, min(g.alpha0, g.alpha0E), g.alpha1E, g.alpha2E)
+        r_E_alphas, r_E_plot = _build_rate_curve_piecewise(
+            rfunE, max(g.alpha0E, g.alpha0), g.alpha1E, g.alpha2E)
         result.update({
             'alpha0E': g.alpha0E,
             'alpha1E': g.alpha1E,
@@ -2309,6 +2337,7 @@ def solve_for_config(name):
             'rnsE': getattr(g, 'rnsE', None),
             'K_E_fine': K_E_fine,
             'K_E_plot': K_E_plot,
+            'r_E_alphas': r_E_alphas,
             'r_E_plot': r_E_plot,
             'almassE': almassE,
             'wE': wmassE,

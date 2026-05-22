@@ -16,8 +16,8 @@ def main():
 
     # --- Panel 1: r(alpha) ---
     ax = axes[0]
-    ax.plot(res['alphas_plot'], res['r_inc_plot'], 'g--', lw=2, label='incumbent')
-    ax.plot(res['alphas_plot'], res['r_E_plot'],   'b-',  lw=2, label='post-entry')
+    ax.plot(res['r_inc_alphas'], res['r_inc_plot'], 'g--', lw=2, label='incumbent')
+    ax.plot(res['r_E_alphas'],   res['r_E_plot'],   'b-',  lw=2, label='post-entry')
     ax.axvline(res['alpha0'],  color='g', ls=':', lw=0.6, alpha=0.5)
     ax.axvline(res['alpha0E'], color='b', ls=':', lw=0.6, alpha=0.5)
     alpha_hat = res['config']['cfunE_params']['alpha_hat']
