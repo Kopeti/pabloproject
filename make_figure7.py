@@ -7,7 +7,7 @@ Produces three PNGs that LaTeX assembles into Figure 7:
                             independent of Pi^E so one entrant curve suffices).
 """
 import mainE_python as m
-from panel_plots import panel_r_alpha, panel_r_omega, panel_K_alpha
+from panel_plots import panel_r_alpha, panel_r_omega, panel_K_alpha, omega_g
 
 
 def main():
@@ -15,6 +15,20 @@ def main():
     incumbent  = m.solve_for_config('FIG7_incumbent')
     sp_highPiE = m.solve_for_config('FIG7_SP_highPiE')
     sp_lowPiE  = m.solve_for_config('FIG7_SP_lowPiE')
+
+    beta = incumbent['config']['beta']
+    omega_1 = omega_g(incumbent['alpha1'], beta)
+    omega_2 = omega_g(incumbent['alpha2'], beta)
+    omega_prime_2 = omega_g(sp_lowPiE['alpha2E'], beta)  # Region IIb boundary
+    omega_annotations = {
+        'vlines': [(omega_1, r'$\omega_1$'),
+                   (omega_prime_2, r"$\omega'_2$"),
+                   (omega_2, r'$\omega_2$')],
+        'regions': [(omega_1 / 2, 'I'),
+                    ((omega_1 + omega_prime_2) / 2, 'IIa'),
+                    ((omega_prime_2 + omega_2) / 2, 'IIb'),
+                    ((omega_2 + 1) / 2, 'III')],
+    }
 
     rate_specs = [
         {'res': incumbent,  'kind': 'incumbent', 'color': 'g', 'linestyle': '--',
@@ -35,7 +49,8 @@ def main():
     ]
 
     panel_r_alpha(rate_specs, 'Figure 7 — r(alpha)',  'fig_r_alpha_fig7.png')
-    panel_r_omega(rate_specs, 'Figure 7 — r(omega)',  'fig_r_omega_fig7.png')
+    panel_r_omega(rate_specs, 'Figure 7 — r(omega)',  'fig_r_omega_fig7.png',
+                  annotations=omega_annotations)
     panel_K_alpha(K_specs,    'Figure 7 — K(alpha)',  'fig_K_alpha_fig7.png')
 
 

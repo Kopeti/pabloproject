@@ -27,6 +27,32 @@ _OUTPUT_DIR = os.path.abspath(
     os.path.join(_HERE, '..', '..', '..', '..', 'Peter-Pablo-Maryam', 'figures'))
 
 
+def omega_g(alpha, beta):
+    """ω_g(α) = β + α (1 − β) — opacity threshold for goods."""
+    return beta + alpha * (1.0 - beta)
+
+
+def find_omega_H(res):
+    """Find ω_H = ω_g(α_H), where K^E first crosses K_inc inside the CIM
+    region [α₁, α₂]. Returns None if there is no crossing in that interval.
+    """
+    if not res.get('has_entry'):
+        return None
+    alphas = res['alphas_plot']
+    diff = res['K_E_plot'] - res['K_inc_plot']
+    mask = (alphas >= res['alpha1']) & (alphas <= res['alpha2'])
+    a_in = alphas[mask]
+    d_in = diff[mask]
+    # Locate the first sign change.
+    for i in range(1, len(d_in)):
+        if d_in[i - 1] * d_in[i] < 0:
+            # Linear interp to the zero
+            x = a_in[i - 1] - d_in[i - 1] * (a_in[i] - a_in[i - 1]) / (d_in[i] - d_in[i - 1])
+            beta = res['config']['beta']
+            return omega_g(x, beta)
+    return None
+
+
 def _trim_to_support(alphas, rates, alpha_upper):
     a = np.asarray(alphas); r = np.asarray(rates)
     mask = (a <= alpha_upper + 1e-9) | np.isnan(a)
@@ -81,8 +107,14 @@ def panel_r_alpha(specs, title, filename):
     _save(fig, filename)
 
 
-def panel_r_omega(specs, title, filename):
-    """r(omega) panel — same spec format as panel_r_alpha."""
+def panel_r_omega(specs, title, filename, annotations=None):
+    """r(omega) panel — same spec format as panel_r_alpha.
+
+    annotations (optional) is a dict:
+        'vlines':  list of (omega_value, label) tuples — vertical dashed lines.
+        'regions': list of (omega_center, label) tuples — region labels along
+                    the top of the panel.
+    """
     fig, ax = plt.subplots(figsize=(7, 5))
     for spec in specs:
         res = spec['res']
@@ -104,6 +136,24 @@ def panel_r_omega(specs, title, filename):
     ax.set_xlim(0, 1)
     ax.set_title(title)
     ax.grid(alpha=0.3); ax.legend(fontsize=9, loc='best')
+
+    if annotations:
+        ymin, ymax = ax.get_ylim()
+        for omega_value, _ in annotations.get('vlines', []):
+            ax.axvline(omega_value, color='gray', ls=':', lw=0.8, alpha=0.7)
+        # Replace the default x-axis ticks with the annotation positions
+        # (plus 0 and 1), so the named ω labels do not collide with the
+        # default 0.2 / 0.4 / ... labels.
+        named_ticks = [(0.0, '0'), (1.0, '1')] + [
+            (omega_value, label) for omega_value, label in annotations.get('vlines', [])]
+        named_ticks.sort(key=lambda t: t[0])
+        ax.set_xticks([t for t, _ in named_ticks])
+        ax.set_xticklabels([l for _, l in named_ticks])
+        for omega_center, label in annotations.get('regions', []):
+            ax.text(omega_center, ymax - 0.04 * (ymax - ymin), label,
+                    ha='center', va='top', fontsize=11, color='dimgray',
+                    fontweight='bold')
+
     _save(fig, filename)
 
 
