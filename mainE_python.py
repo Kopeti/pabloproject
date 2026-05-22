@@ -2259,15 +2259,20 @@ def _build_rate_curve_piecewise(rate_fn, alpha0, alpha1, alpha2,
     rate_fn(alpha_array, alpha0, alpha1, alpha2) — vectorized rate function
     matching the rfun / rfunE signature.
     """
-    eps = 1e-6
+    eps = 1e-4   # large enough to create a visible gap (~1% of α-range)
     # Collect all breakpoints, dedupe, sort, drop those outside [alpha0, 1].
     raw = [alpha0, alpha1, alpha2, 1.0] + [b for b in extra_breakpoints]
     raw = [b for b in raw if alpha0 - 1e-9 <= b <= 1.0 + 1e-9]
     bps = sorted(set(round(b, 8) for b in raw))
     # Build a segment between each consecutive pair, NaN-separated.
+    # We sample the OPEN interval (bps[i], bps[i+1]) — i.e. shifted slightly past
+    # the breakpoint on both sides — so that the segment carries the value of
+    # the relevant region (not the boundary case which often belongs to the
+    # *previous* region under rfun/rfunE's `<=` branching).
     segs_a, segs_r = [], []
     for i in range(len(bps) - 1):
-        lo, hi = bps[i], bps[i + 1] - eps
+        lo = bps[i] + (eps if i > 0 else 0.0)   # leftmost segment starts AT alpha0
+        hi = bps[i + 1] - eps if i + 1 < len(bps) - 1 else bps[i + 1]
         if hi <= lo:
             continue
         n_pts = max(2, int(n * (hi - lo)))
