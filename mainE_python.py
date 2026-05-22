@@ -2288,6 +2288,48 @@ def _build_rate_curve_piecewise(rate_fn, alpha0, alpha1, alpha2,
     return alphas, rates
 
 
+def _build_omega_curve_from_alpha(r_alphas, r_rates, beta,
+                                   alpha0_eff, r_pooling, alpha2_eff, r_NS,
+                                   n_extra=80, eps=1e-4):
+    """Map an α-axis rate curve to ω-axis via ω = ω_g(α) = β + α(1−β).
+
+    Inputs:
+        r_alphas, r_rates: existing α-axis curve (may contain NaN sentinels).
+        alpha0_eff, alpha2_eff: skill thresholds used to extend the curve.
+        r_pooling: rate for ω < ω_g(alpha0_eff)   (Region I extension).
+        r_NS:      rate for ω > ω_g(alpha2_eff)   (Region III extension).
+    Output:
+        (omegas, rates) — r as a function of ω ∈ [0, 1].
+            • flat at r_pooling on the left, until ω = ω_g(alpha0_eff);
+            • mapped α-curve on the middle, with the original NaN sentinels
+              preserved at α-discontinuities;
+            • flat at r_NS on the right, from ω = ω_g(alpha2_eff) to 1.
+        NaN sentinels are inserted at the join points so matplotlib breaks
+        the line cleanly at any discontinuity.
+    """
+    omg_low = beta + alpha0_eff * (1 - beta)
+    omg_high = beta + alpha2_eff * (1 - beta)
+
+    # Left extension: ω in [0, ω_g(α₀_eff) - eps], flat at r_pooling.
+    n_left = max(2, int(n_extra * omg_low))
+    om_left = np.linspace(0.0, max(omg_low - eps, 0.0), n_left)
+    r_left = np.full(len(om_left), r_pooling)
+
+    # Right extension: ω in [ω_g(α₂_eff) + eps, 1], flat at r_NS.
+    n_right = max(2, int(n_extra * (1 - omg_high)))
+    om_right = np.linspace(min(omg_high + eps, 1.0), 1.0, n_right)
+    r_right = np.full(len(om_right), r_NS)
+
+    # Middle: map α-curve to ω-curve.
+    om_mid = beta + r_alphas * (1 - beta)
+    r_mid = np.asarray(r_rates, dtype=float).copy()
+
+    nan = np.array([np.nan])
+    omegas = np.concatenate([om_left, nan, om_mid, nan, om_right])
+    rates = np.concatenate([r_left, nan, r_mid, nan, r_right])
+    return omegas, rates
+
+
 def solve_for_config(name):
     """Run incumbent (and entry, if configured) solve for a named config.
 
@@ -2318,6 +2360,11 @@ def solve_for_config(name):
     # Build the incumbent rate curve piecewise with NaN gaps at α₁ and α₂.
     r_inc_alphas, r_inc_plot = _build_rate_curve_piecewise(
         rfun, g.alpha0, g.alpha1, g.alpha2)
+    # Same curve in ω-space: r(ω) over ω ∈ [0,1] with pooling-flat prefix
+    # and NS-flat suffix.
+    r_NS_inc = _scalar(cfun(g.alpha2)) + g.Pi  # baseline NS rate = K(α₂)
+    r_inc_omegas, r_inc_omega_rates = _build_omega_curve_from_alpha(
+        r_inc_alphas, r_inc_plot, g.beta, g.alpha0, g.rp, g.alpha2, r_NS_inc)
     K_inc_fine = np.array([_scalar(cfun(a)) for a in g.baseline_alphas_fine]) + g.Pi
     K_inc_plot = np.array([_scalar(cfun(a)) for a in alphas_plot]) + g.Pi
 
@@ -2336,6 +2383,8 @@ def solve_for_config(name):
         'alphas_plot': alphas_plot,
         'r_inc_alphas': r_inc_alphas,
         'r_inc_plot': r_inc_plot,
+        'r_inc_omegas': r_inc_omegas,
+        'r_inc_omega_rates': r_inc_omega_rates,
         'K_inc_plot': K_inc_plot,
         'has_entry': cfg.get('has_entry', True),
     }
@@ -2351,6 +2400,14 @@ def solve_for_config(name):
         r_E_alphas, r_E_plot = _build_rate_curve_piecewise(
             rfunE, max(g.alpha0E, g.alpha0), g.alpha1E, g.alpha2E,
             extra_breakpoints=(g.alpha1, g.alpha2))
+        # ω-axis version of the entrant rate.
+        # The "top" α for the entrant is max(alpha2E, alpha2) — covers both the
+        # CIM-extended-right case (fig8) and the Region-IIb case (fig9a).
+        alpha2_eff = max(g.alpha2E, g.alpha2)
+        r_E_omegas, r_E_omega_rates = _build_omega_curve_from_alpha(
+            r_E_alphas, r_E_plot, g.beta,
+            max(g.alpha0E, g.alpha0), g.rpE,
+            alpha2_eff, g.rnsE)
         result.update({
             'alpha0E': g.alpha0E,
             'alpha1E': g.alpha1E,
@@ -2361,6 +2418,8 @@ def solve_for_config(name):
             'K_E_plot': K_E_plot,
             'r_E_alphas': r_E_alphas,
             'r_E_plot': r_E_plot,
+            'r_E_omegas': r_E_omegas,
+            'r_E_omega_rates': r_E_omega_rates,
             'almassE': almassE,
             'wE': wmassE,
             'gammaE': gammaE,

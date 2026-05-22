@@ -1,52 +1,28 @@
 """Figure 9b (fig:OB right panel) — Open Banking, broad adoption.
 
-Entrants get a cost reduction for intermediate alpha (C^E < C for alpha < alpha_hat,
-with alpha_hat in the intermediate range).
-Output: fig9b.png — 2 panels (r and K).
+Produces three PNGs:
+    fig_r_alpha_fig9b.png    r(alpha) for incumbent + post-entry.
+    fig_r_omega_fig9b.png    r(omega) for incumbent + post-entry.
+    fig_K_alpha_fig9b.png    K(alpha) and K^E(alpha).
 """
-import os
-import matplotlib.pyplot as plt
 import mainE_python as m
+from panel_plots import panel_r_alpha, panel_r_omega, panel_K_alpha
 
 
 def main():
-    print("=" * 60); print("Building Figure 9b (Open Banking, broad)"); print("=" * 60)
+    print("=" * 60); print("Building Figure 9b (OB, broad adoption)"); print("=" * 60)
     res = m.solve_for_config('FIG9_OB_broad')
 
-    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+    specs = [
+        {'res': res, 'kind': 'incumbent', 'color': 'g', 'linestyle': '--',
+         'label': 'incumbent'},
+        {'res': res, 'kind': 'entrant',   'color': 'b', 'linestyle': '-',
+         'label': 'post-entry'},
+    ]
 
-    # --- Panel 1: r(alpha) ---
-    ax = axes[0]
-    ax.plot(res['r_inc_alphas'], res['r_inc_plot'], 'g--', lw=2, label='incumbent')
-    ax.plot(res['r_E_alphas'],   res['r_E_plot'],   'b-',  lw=2, label='post-entry')
-    ax.axvline(res['alpha0'],  color='g', ls=':', lw=0.6, alpha=0.5)
-    ax.axvline(res['alpha0E'], color='b', ls=':', lw=0.6, alpha=0.5)
-    params = res['config'].get('cfunE_params', {})
-    alpha_marker = params.get('alpha_hat', params.get('alpha_center'))
-    if alpha_marker is not None:
-        ax.axvline(alpha_marker, color='k', ls='--', lw=0.8, alpha=0.7,
-                   label=fr'$\alpha_{{marker}} = {alpha_marker:.2f}$')
-    ax.set_xlabel(r'$\alpha$'); ax.set_ylabel(r'$r(\alpha)$')
-    ax.set_title('Interest-rate schedule'); ax.grid(alpha=0.3); ax.legend(fontsize=9)
-
-    # --- Panel 2: K(alpha) ---
-    ax = axes[1]
-    ax.plot(res['alphas_plot'], res['K_inc_plot'], 'g--', lw=2,
-            label=r'$K(\alpha) = \Pi + C(\alpha)$ (incumbent)')
-    ax.plot(res['alphas_plot'], res['K_E_plot'],   'b-',  lw=2,
-            label=r'$K^E(\alpha) = \Pi^E + C^E(\alpha)$ (entrant)')
-    if alpha_marker is not None:
-        ax.axvline(alpha_marker, color='k', ls='--', lw=0.8, alpha=0.7,
-                   label=fr'$\alpha_{{marker}} = {alpha_marker:.2f}$')
-    ax.set_xlabel(r'$\alpha$'); ax.set_ylabel(r'$K(\alpha)$')
-    ax.set_title('Modified cost'); ax.grid(alpha=0.3); ax.legend(fontsize=9)
-
-    fig.suptitle('Figure 9b — Open Banking, broad adoption', fontsize=12)
-    fig.tight_layout()
-
-    out = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'fig9b.png')
-    fig.savefig(out, dpi=150, bbox_inches='tight')
-    print(f"Saved: {out}")
+    panel_r_alpha(specs, 'Figure 9b — r(alpha)',  'fig_r_alpha_fig9b.png')
+    panel_r_omega(specs, 'Figure 9b — r(omega)',  'fig_r_omega_fig9b.png')
+    panel_K_alpha(specs, 'Figure 9b — K(alpha)',  'fig_K_alpha_fig9b.png')
 
 
 if __name__ == '__main__':
