@@ -2247,27 +2247,39 @@ def convergence_test(deltas=None):
 # Public API for figure-driver scripts
 # =============================================================================
 
-def _build_rate_curve_piecewise(rate_fn, alpha0, alpha1, alpha2, n=400):
+def _build_rate_curve_piecewise(rate_fn, alpha0, alpha1, alpha2,
+                                extra_breakpoints=(), n=400):
     """Construct a rate curve r(α) with NaN sentinels at each discontinuity.
 
-    Returns (alphas, rates) where matplotlib will draw separate segments for
-    Region I (pooling, [α₀, α₁)), Region II (CIM, [α₁, α₂)), and Region III
-    (NS, [α₂, 1]), separated by NaN gaps at α₁ and α₂.
+    Returns (alphas, rates) where matplotlib will draw separate segments
+    separated by NaN gaps at every breakpoint.  Breakpoints are the union of
+    (alpha0, alpha1, alpha2, 1.0) and any `extra_breakpoints` (e.g. the
+    incumbent's alpha1/alpha2 when those differ from the entrant's).
 
     rate_fn(alpha_array, alpha0, alpha1, alpha2) — vectorized rate function
     matching the rfun / rfunE signature.
     """
     eps = 1e-6
-    # Three segments, each sampled densely; NaN sentinels between them.
-    seg1_a = np.linspace(alpha0, alpha1 - eps, max(2, int(n * (alpha1 - alpha0))))
-    seg2_a = np.linspace(alpha1, alpha2 - eps, max(2, int(n * (alpha2 - alpha1))))
-    seg3_a = np.linspace(alpha2, 1.0, max(2, int(n * (1.0 - alpha2))))
-    seg1_r = rate_fn(seg1_a, alpha0, alpha1, alpha2)
-    seg2_r = rate_fn(seg2_a, alpha0, alpha1, alpha2)
-    seg3_r = rate_fn(seg3_a, alpha0, alpha1, alpha2)
+    # Collect all breakpoints, dedupe, sort, drop those outside [alpha0, 1].
+    raw = [alpha0, alpha1, alpha2, 1.0] + [b for b in extra_breakpoints]
+    raw = [b for b in raw if alpha0 - 1e-9 <= b <= 1.0 + 1e-9]
+    bps = sorted(set(round(b, 8) for b in raw))
+    # Build a segment between each consecutive pair, NaN-separated.
+    segs_a, segs_r = [], []
+    for i in range(len(bps) - 1):
+        lo, hi = bps[i], bps[i + 1] - eps
+        if hi <= lo:
+            continue
+        n_pts = max(2, int(n * (hi - lo)))
+        a = np.linspace(lo, hi, n_pts)
+        r = rate_fn(a, alpha0, alpha1, alpha2)
+        segs_a.append(a)
+        segs_r.append(r)
     nan = np.array([np.nan])
-    alphas = np.concatenate([seg1_a, nan, seg2_a, nan, seg3_a])
-    rates = np.concatenate([seg1_r, nan, seg2_r, nan, seg3_r])
+    alphas = np.concatenate([s for pair in zip(segs_a, [nan] * len(segs_a))
+                              for s in pair][:-1])  # drop trailing NaN
+    rates = np.concatenate([s for pair in zip(segs_r, [nan] * len(segs_r))
+                             for s in pair][:-1])
     return alphas, rates
 
 
@@ -2327,8 +2339,13 @@ def solve_for_config(name):
         almassE, wmassE, gammaE, WE = run_mainE()
         K_E_fine = np.array([_scalar(cfunE(a)) for a in g.baseline_alphas_fine]) + g.PiE
         K_E_plot = np.array([_scalar(cfunE(a)) for a in alphas_plot]) + g.PiE
+        # The entrant rate function has internal thresholds at the incumbent's
+        # alpha1 and alpha2 (where the lower-envelope rule and the Region-IIb
+        # rtildeafunE come in), in addition to alpha0E/alpha1E/alpha2E.
+        # Pass these as extra breakpoints so every discontinuity gets a gap.
         r_E_alphas, r_E_plot = _build_rate_curve_piecewise(
-            rfunE, max(g.alpha0E, g.alpha0), g.alpha1E, g.alpha2E)
+            rfunE, max(g.alpha0E, g.alpha0), g.alpha1E, g.alpha2E,
+            extra_breakpoints=(g.alpha1, g.alpha2))
         result.update({
             'alpha0E': g.alpha0E,
             'alpha1E': g.alpha1E,
