@@ -19,6 +19,12 @@ import matplotlib.pyplot as plt
 
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
+# Save the PNGs to the paper's figures folder, computed relative to this
+# script so the path stays correct on any machine.  From
+# .../The-pablo-project/maryampabloprojectmynotes/matlab/integratewithiid/pythonversion
+# the paper figures folder is four levels up + Peter-Pablo-Maryam/figures.
+_OUTPUT_DIR = os.path.abspath(
+    os.path.join(_HERE, '..', '..', '..', '..', 'Peter-Pablo-Maryam', 'figures'))
 
 
 def _trim_to_support(alphas, rates, alpha_upper):
@@ -28,7 +34,8 @@ def _trim_to_support(alphas, rates, alpha_upper):
 
 
 def _save(fig, name):
-    out = os.path.join(_HERE, name)
+    os.makedirs(_OUTPUT_DIR, exist_ok=True)
+    out = os.path.join(_OUTPUT_DIR, name)
     fig.savefig(out, dpi=150, bbox_inches='tight')
     plt.close(fig)
     print(f"Saved: {out}")
