@@ -124,19 +124,27 @@ PARAM_CONFIGS = {
         # The multiplicative form ensures K^E(0) = Π^E automatically (since C(0)=0),
         # so the constraint K^E(0) = Π^E is a *property of the form* rather than
         # a tuning target that conflicts with the rprime branch.
-        **_DEFAULT_INC_BASELINE,
+        # Pi matches fig9a (0.235) so both panels share the same incumbent
+        # thresholds (alpha0=0.056, alpha1=0.351, alpha2=0.633).
+        'Pi': 0.235,
+        'beta': 0.5,
+        'BperG': 1.0,
+        'cfun': lambda alpha: 9.0 * alpha**2 + 0.2 * alpha,
         'has_entry': True,
-        'PiE': 0.2,
+        'PiE': 0.235,
         'cfunE_kind': 'cost_dip_multiplicative',
         'cfunE_params': {
-            # α_c=0.25, σ=0.05: cream-skim band centered just below α₁=0.346.
-            # δ_dip=0.40, δ_baseline=0.10:
-            #   multiplier at α_c = 0.70 → C^E(α_c) = 0.70·C(α_c)
-            #   multiplier at α₁  ≈ 1.04 → K^E > K_inc on (α₁,α₂) ⇒ no CIM entry
+            # α_c=0.25, σ=0.05: cream-skim band centered just below α₁≈0.351.
+            # δ_dip=0.50, δ_baseline=0.10:
+            #   multiplier at α_c = 0.60 → C^E(α_c) = 0.60·C(α_c)
+            #   multiplier at α₁  ≈ 1.02 → K^E > K_inc on (α₁,α₂) ⇒ no CIM entry
             #   multiplier at α=0 → C^E(0) = 0 ⇒ K^E(0) = Π^E exactly
+            # δ_dip was 0.40 originally; raised to 0.50 to push the r_NS rise
+            # from +0.023 to +0.036 (56% larger).  Monotonicity holds with
+            # positive margin; Region II gap floor is +0.042.
             'alpha_center': 0.25,
             'sigma': 0.05,
-            'delta_dip': 0.40,
+            'delta_dip': 0.50,
             'delta_baseline': 0.10,
         },
     },
