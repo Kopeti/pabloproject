@@ -90,22 +90,26 @@ PARAM_CONFIGS = {
     },
     'FIG9_OB_limited': {
         'description': 'Figure 9a / fig:OB left - Open Banking, limited adoption (cost advantage at low alpha).',
-        # Clean cost_offset_smooth replacing the legacy SP+addon hack.
-        # Offset is negative at low alpha (entrant cheaper -> pooling and NS
-        # entry, rate goes down) and modestly positive at high alpha (entrant
-        # slightly above incumbent K -> no CIM entry, K^E close to K_inc).
-        # The sigmoid offset is monotone-increasing so K^E remains monotone
-        # by construction (no slope constraint needed).
+        # Legacy SP + add-ons form, restored as the starting point.
+        # K^E = γ(α)·(1 + D⁻¹((1/κ)·D((Π+1+C)/γ - 1))) - 1 - Π^E
+        #         + κ₁·α·(α-α̅)                       (distortion)
+        #         + 0.1·min(0.1·(1/(α₁-α) - 1/α₁), 100) if α<α₁  (low-α addon, spike near α₁)
+        #         + 0.1·(100 + (α-α₁))                  if α>α₁  (high-α addon)
+        # This is the parametrization that historically produced a wide Region IIb
+        # in figure 9a (α₀^E ≈ 0.22 — entrants concentrated near the top of pooling,
+        # heavy cream-skim, NS rate visibly down).  We will iterate parameters from
+        # here.
         **_DEFAULT_INC_BASELINE,
         'has_entry': True,
-        'PiE': 0.2,                  # same as Pi; NS entry advantage comes from the offset
-        'cfunE_kind': 'cost_offset_smooth',
-        'cfunE_params': {
-            'alpha_hat': 0.18,        # transition centered in lower half of pooling
-            'delta_low': 0.10,        # entrant K below incumbent K by ~0.10 at low alpha
-            'delta_high': 0.05,       # entrant K above incumbent K by 0.05 at high alpha
-            'transition_width': 0.04,
-        },
+        'PiE': 0.1,
+        'cfunE_kind': 'selection_preserving',
+        'cfunE_params': {'kappa': 1.1, 'use_smoothing': True,
+                         'use_legacy_addons': True, 'kappa1_distortion': -4.0,
+                         # Lowered from legacy 100 → kink slides from α≈0.336 to
+                         # α≈0.269 and K^E plateau drops from +10 to +1.  Outcome
+                         # (α₀^E≈0.22, Region IIb=0.088, r_NS drop=0.36) is unchanged
+                         # down to cap≈10; below that α₂^E flips above α₂.
+                         'addon_cap': 10.0},
     },
     'FIG9_OB_broad': {
         'description': 'Figure 9b / fig:OB right - Open Banking, broad adoption (cost advantage band at intermediate alpha).',
@@ -269,7 +273,8 @@ def _resolve_cfunE_mode(cfg):
         return 'simple', params
 
     if kind in ('cost_reduction_top', 'cost_reduction_low',
-                'cost_offset_smooth', 'cost_dip_gaussian'):
+                'cost_offset_smooth', 'cost_dip_gaussian',
+                'cost_exp_decay'):
         # New kinds — handled directly in cfunE, no legacy mode.
         return kind, params
 
@@ -504,10 +509,26 @@ def _build_cfunE_pchip():
     kappa = params.get('kappa', 1.1)
     use_legacy_addons = params.get('use_legacy_addons', False)
     kappa1_dist = params.get('kappa1_distortion', 0.0)
+    # spike_alpha = α at which the addon blows up.  Defaults to α₁ (legacy).
+    spike_alpha = params.get('spike_alpha', g.alpha1)
+    # addon_cap = the cap height (legacy maxc=100, → plateau at 0.1·100 = 10).
+    # Lowering it: keeps the left hyperbolic 1/(s-α) anchored, but cuts it off
+    # sooner (kink slides left) and lowers the right-side plateau (entrants no
+    # longer locked out at high α).
+    maxc = params.get('addon_cap', 100.0)
 
     alpha1 = g.alpha1
-    maxc = 100.0
     alphabar = (g.alpha0 + g.alpha1) / 2.0
+
+    # Pre-compute base_cost and distortion at α = spike_alpha for the
+    # "parallel right-piece" extension.  For α > spike_alpha we freeze these
+    # at their α=s values and add only cfun(α)-cfun(s), so K^E rises in
+    # lockstep with K_inc on the right (parallel to the green curve).
+    gu_s = _scalar(gammaupdate2(spike_alpha, g.alpha0, g.rp))
+    inner_r_s = (g.Pi + 1 + _scalar(cfun(spike_alpha))) / gu_s - 1
+    base_at_s = gu_s * (1 + _scalar(dfuninv(kappa * _scalar(dfun(inner_r_s))))) - (1 + g.PiE)
+    distort_at_s = kappa1_dist * spike_alpha * (spike_alpha - alphabar)
+    cfun_at_s = _scalar(cfun(spike_alpha))
 
     # Evaluate each component separately
     base_costs = np.zeros(len(grid))
@@ -515,16 +536,22 @@ def _build_cfunE_pchip():
     addons = np.zeros(len(grid))
 
     for i, a in enumerate(grid):
+        if use_legacy_addons and a > spike_alpha:
+            # Parallel extension: freeze base+distortion at α=s, addon supplies
+            # the cap height plus K_inc-parallel rise.
+            base_costs[i] = base_at_s
+            distortions[i] = distort_at_s
+            addons[i] = 0.1 * maxc + (_scalar(cfun(a)) - cfun_at_s)
+            continue
+
         gu = _scalar(gammaupdate2(a, g.alpha0, g.rp))
         inner_r = (g.Pi + 1 + _scalar(cfun(a))) / gu - 1
         base_costs[i] = gu * (1 + _scalar(dfuninv(kappa * _scalar(dfun(inner_r))))) - (1 + g.PiE)
         if use_legacy_addons:
             distortions[i] = kappa1_dist * a * (a - alphabar)
-            if a < alpha1:
-                addons[i] = 0.1 * min(0.1 * (1.0 / max(alpha1 - a, 1e-6) - 1.0 / alpha1), maxc)
-            elif a > alpha1:
-                addons[i] = 0.1 * (maxc + (a - alpha1))
-            else:
+            if a < spike_alpha:
+                addons[i] = 0.1 * min(0.1 * (1.0 / max(spike_alpha - a, 1e-6) - 1.0 / spike_alpha), maxc)
+            else:  # a == spike_alpha
                 addons[i] = 0.1 * maxc
 
     # Smooth base_cost: this is the noisy component (from discrete omega grid).
@@ -602,6 +629,26 @@ def cfunE(alpha):
         ca = c_inc + offset
         return _scalar(ca[0]) if len(alpha_arr) == 1 else ca
 
+    # --- cost_exp_decay: exponential-decay offset.
+    # C^E(α) = C(α) + delta_baseline - delta_low · exp(-α / tau).
+    # At α = 0: offset = delta_baseline - delta_low (deeply negative if
+    #   delta_low > delta_baseline).
+    # At α → ∞: offset → delta_baseline (mild positive cushion).
+    # The offset is monotonically *increasing* in α, so K^E = K_inc + offset
+    # is automatically monotone regardless of how steep the discount is.
+    # This decouples the deep discount needed at α=0 (to drive NS entry and
+    # widen Region IIb) from the slope constraint that bites cost_offset_smooth
+    # at low α.
+    if mode == 'cost_exp_decay':
+        alpha_arr = np.atleast_1d(np.asarray(alpha, dtype=float))
+        delta_low = params['delta_low']
+        tau = params['tau']
+        delta_baseline = params.get('delta_baseline', 0.0)
+        c_inc = np.array([_scalar(cfun(a)) for a in alpha_arr])
+        offset = delta_baseline - delta_low * np.exp(-alpha_arr / tau)
+        ca = c_inc + offset
+        return _scalar(ca[0]) if len(alpha_arr) == 1 else ca
+
     # --- cost_dip_gaussian: a Gaussian-shaped cost ADVANTAGE band centered at
     # alpha_center, with a baseline disadvantage delta_baseline elsewhere.
     # C^E(α) = C(α) + delta_baseline - delta_dip · exp(-(α-α_c)²/(2σ²))
@@ -646,12 +693,28 @@ def cfunE(alpha):
     kappa = params.get('kappa', 1.1)
     use_legacy_addons = params.get('use_legacy_addons', False)
     kappa1_dist = params.get('kappa1_distortion', 0.0)
-    maxa = g.alpha1
-    maxc = 100.0
+    # spike_alpha = α at which the addon blows up.  Defaults to α₁ (legacy).
+    maxa = params.get('spike_alpha', g.alpha1)
+    # addon_cap = cap height — see _build_cfunE_smooth for explanation.
+    maxc = params.get('addon_cap', 100.0)
     alphabar = (g.alpha0 + g.alpha1) / 2.0
+
+    # Pre-compute base + distortion at α = maxa for the parallel right-piece.
+    if use_legacy_addons:
+        gu_s = _scalar(gammaupdate2(maxa, g.alpha0, g.rp))
+        inner_r_s = (g.Pi + 1 + _scalar(cfun(maxa))) / gu_s - 1
+        base_at_s = gu_s * (1 + _scalar(dfuninv(kappa * _scalar(dfun(inner_r_s))))) - (1 + g.PiE)
+        distort_at_s = kappa1_dist * maxa * (maxa - alphabar)
+        cfun_at_s = _scalar(cfun(maxa))
 
     for i in range(len(alpha)):
         a = alpha[i]
+
+        if use_legacy_addons and a > maxa:
+            # Parallel extension: K^E(α) = K^E(s) + (cfun(α) - cfun(s)).
+            ca[i] = base_at_s + distort_at_s + 0.1 * maxc + (_scalar(cfun(a)) - cfun_at_s)
+            continue
+
         gu = gammaupdate2(a, g.alpha0, g.rp)
         gu = _scalar(gu)
 
@@ -666,9 +729,9 @@ def cfunE(alpha):
         if use_legacy_addons:
             distortion = kappa1_dist * a * (a - alphabar)
             if a < maxa:
-                addon = 0.1 * min(0.1 * (1.0 / (maxa - a) - 1.0 / maxa), maxc)
-            elif a > maxa:
-                addon = 0.1 * (maxc + (a - maxa))
+                addon = 0.1 * min(0.1 * (1.0 / max(maxa - a, 1e-6) - 1.0 / maxa), maxc)
+            else:  # a == maxa
+                addon = 0.1 * maxc
 
         ca[i] = base_cost + distortion + addon
 
