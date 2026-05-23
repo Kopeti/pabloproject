@@ -90,25 +90,30 @@ PARAM_CONFIGS = {
     },
     'FIG9_OB_limited': {
         'description': 'Figure 9a / fig:OB left - Open Banking, limited adoption (cost advantage at low alpha).',
-        # Legacy SP + add-ons form, restored as the starting point.
+        # Legacy SP + add-ons cost form (selection_preserving + legacy_addons).
         # K^E = γ(α)·(1 + D⁻¹((1/κ)·D((Π+1+C)/γ - 1))) - 1 - Π^E
-        #         + κ₁·α·(α-α̅)                       (distortion)
-        #         + 0.1·min(0.1·(1/(α₁-α) - 1/α₁), 100) if α<α₁  (low-α addon, spike near α₁)
-        #         + 0.1·(100 + (α-α₁))                  if α>α₁  (high-α addon)
-        # This is the parametrization that historically produced a wide Region IIb
-        # in figure 9a (α₀^E ≈ 0.22 — entrants concentrated near the top of pooling,
-        # heavy cream-skim, NS rate visibly down).  We will iterate parameters from
-        # here.
-        **_DEFAULT_INC_BASELINE,
+        #         + κ₁·α·(α-α̅)                                  (distortion)
+        #         + hyperbolic left addon (capped at 0.1·addon_cap, kink at α=α₁)
+        #         + parallel right piece (K^E rises in lockstep with K_inc for α>α₁)
+        #
+        # Pi/Pi^E chosen so that Pi^E = K^E(0) (i.e. zero entrant rents at α=0
+        # in the limit of the marginal lender breaking even).  K^E(0) for the SP
+        # form depends only on Pi and γ(0), not on Pi^E, so this is a one-shot
+        # set rather than a fixed point.  Pi=0.235 lifts the rate scale up by
+        # ~16% but preserves α₀, α₁, α₀^E and Region IIb width (0.086) almost
+        # exactly; r_NS drop shrinks from 0.36 to 0.26 (still clearly positive
+        # spillover).
+        'Pi': 0.235,
+        'beta': 0.5,
+        'BperG': 1.0,
+        'cfun': lambda alpha: 9.0 * alpha**2 + 0.2 * alpha,
         'has_entry': True,
-        'PiE': 0.1,
+        'PiE': 0.168,
         'cfunE_kind': 'selection_preserving',
         'cfunE_params': {'kappa': 1.1, 'use_smoothing': True,
                          'use_legacy_addons': True, 'kappa1_distortion': -4.0,
                          # Lowered from legacy 100 → kink slides from α≈0.336 to
-                         # α≈0.269 and K^E plateau drops from +10 to +1.  Outcome
-                         # (α₀^E≈0.22, Region IIb=0.088, r_NS drop=0.36) is unchanged
-                         # down to cap≈10; below that α₂^E flips above α₂.
+                         # α≈0.269 and K^E plateau drops from +10 to +1.
                          'addon_cap': 10.0},
     },
     'FIG9_OB_broad': {
