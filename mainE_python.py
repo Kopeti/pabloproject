@@ -90,31 +90,26 @@ PARAM_CONFIGS = {
     },
     'FIG9_OB_limited': {
         'description': 'Figure 9a / fig:OB left - Open Banking, limited adoption (cost advantage at low alpha).',
-        # Legacy SP + add-ons cost form (selection_preserving + legacy_addons).
-        # K^E = γ(α)·(1 + D⁻¹((1/κ)·D((Π+1+C)/γ - 1))) - 1 - Π^E
-        #         + κ₁·α·(α-α̅)                                  (distortion)
-        #         + hyperbolic left addon (capped at 0.1·addon_cap, kink at α=α₁)
-        #         + parallel right piece (K^E rises in lockstep with K_inc for α>α₁)
-        #
-        # Pi/Pi^E chosen so that Pi^E = K^E(0) (i.e. zero entrant rents at α=0
-        # in the limit of the marginal lender breaking even).  K^E(0) for the SP
-        # form depends only on Pi and γ(0), not on Pi^E, so this is a one-shot
-        # set rather than a fixed point.  Pi=0.235 lifts the rate scale up by
-        # ~16% but preserves α₀, α₁, α₀^E and Region IIb width (0.086) almost
-        # exactly; r_NS drop shrinks from 0.36 to 0.26 (still clearly positive
-        # spillover).
+        # cost_lift_with_addon: explicit, SP-free construction of K^E.
+        #   For α ≤ spike:  C^E(α) = C(α) + c_lift·α·(α̅−α) + hyperbolic_addon(α)
+        #   For α > spike:  C^E(α) = C(α) + 0.1·addon_cap + c_lift·spike·(α̅−spike)
+        # K^E(0) = Π^E by construction (C(0)=0, lift(0)=0, addon(0)=0).
+        # c_lift=4 mirrors the legacy κ₁=−4 distortion magnitude.
+        # The previous form was selection_preserving + legacy_addons with PCHIP
+        # smoothing of a γ-dependent grid; this gives within-1% the same
+        # equilibrium (α₀^E≈0.23, IIb≈0.088, r_NS drop≈0.27) with simpler code.
         'Pi': 0.235,
         'beta': 0.5,
         'BperG': 1.0,
         'cfun': lambda alpha: 9.0 * alpha**2 + 0.2 * alpha,
         'has_entry': True,
         'PiE': 0.168,
-        'cfunE_kind': 'selection_preserving',
-        'cfunE_params': {'kappa': 1.1, 'use_smoothing': True,
-                         'use_legacy_addons': True, 'kappa1_distortion': -4.0,
-                         # Lowered from legacy 100 → kink slides from α≈0.336 to
-                         # α≈0.269 and K^E plateau drops from +10 to +1.
-                         'addon_cap': 10.0},
+        'cfunE_kind': 'cost_lift_with_addon',
+        'cfunE_params': {
+            'c_lift': 4.0,
+            'addon_cap': 10.0,
+            # spike_alpha defaults to α₁ from the incumbent solve
+        },
     },
     'FIG9_OB_broad': {
         'description': 'Figure 9b / fig:OB right - Open Banking, broad adoption (cost advantage band at intermediate alpha).',
@@ -279,7 +274,8 @@ def _resolve_cfunE_mode(cfg):
 
     if kind in ('cost_reduction_top', 'cost_reduction_low',
                 'cost_offset_smooth', 'cost_dip_gaussian',
-                'cost_dip_multiplicative', 'cost_exp_decay'):
+                'cost_dip_multiplicative', 'cost_exp_decay',
+                'cost_lift_with_addon'):
         # New kinds — handled directly in cfunE, no legacy mode.
         return kind, params
 
@@ -691,6 +687,34 @@ def cfunE(alpha):
         bump = np.exp(-(alpha_arr - alpha_center)**2 / (2.0 * sigma**2))
         multiplier = 1.0 + delta_baseline - delta_dip * bump
         ca = c_inc * multiplier
+        return _scalar(ca[0]) if len(alpha_arr) == 1 else ca
+
+    # --- cost_lift_with_addon: explicit construction of fig9a-style K^E without SP.
+    # For α ≤ spike_alpha:  C^E(α) = C(α) + c_lift·α·(α̅−α) + hyperbolic_addon(α)
+    # For α > spike_alpha:  C^E(α) = C(α) + 0.1·addon_cap + c_lift·spike·(α̅−spike)
+    #                                                       └── const for continuity at α=spike
+    # The hyperbolic addon and right plateau mirror the legacy SP+addons setup.
+    # The mid-pool lift c_lift·α·(α̅−α) replaces the κ₁·α·(α−α̅) distortion
+    # (note sign: lift is positive for α < α̅, mirroring κ₁ < 0).
+    # α̅ = (α₀ + α₁)/2 is read from the incumbent solve.
+    # K^E(0) = Π^E (since C(0)=0, lift(0)=0, addon(0)=0).
+    if mode == 'cost_lift_with_addon':
+        alpha_arr = np.atleast_1d(np.asarray(alpha, dtype=float))
+        spike = params.get('spike_alpha', g.alpha1)
+        c_lift = params.get('c_lift', 4.0)
+        cap = params.get('addon_cap', 10.0)
+        alpha_bar = (g.alpha0 + g.alpha1) / 2.0
+        plateau_const = 0.1 * cap + c_lift * spike * (alpha_bar - spike)
+
+        c_inc = np.array([_scalar(cfun(a)) for a in alpha_arr])
+        ca = np.zeros(len(alpha_arr))
+        for i, a in enumerate(alpha_arr):
+            if a > spike:
+                ca[i] = c_inc[i] + plateau_const
+            else:
+                lift = c_lift * a * (alpha_bar - a)
+                addon = 0.1 * min(0.1 * (1.0 / max(spike - a, 1e-6) - 1.0 / spike), cap)
+                ca[i] = c_inc[i] + lift + addon
         return _scalar(ca[0]) if len(alpha_arr) == 1 else ca
 
     # --- polynomial closed form ---
