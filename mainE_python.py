@@ -119,32 +119,24 @@ PARAM_CONFIGS = {
     'FIG9_OB_broad': {
         'description': 'Figure 9b / fig:OB right - Open Banking, broad adoption (cost advantage band at intermediate alpha).',
         # Target equilibrium branch: rprime is min AND rprime > K(α₂)
-        # ("rNS goes up, no NS entry" branch from prop:EntEqHeterogC proof,
-        # lines 1432-1433 of the LaTeX).
-        # The Gaussian dip is centered closer to α₁ with a deeper dip and a
-        # higher baseline, so:
-        #   (a) entrants prefer α near α_center > α₀ → more cream-skimming of
-        #       goods → larger badleftoverE → r_NS^E visibly above r_NS.
-        #   (b) K^E rises above K_inc cleanly outside the band (delta_baseline)
-        #       so rdprime, rtprime are not the minimum.
+        # ("rNS goes up, no NS entry" branch from prop:EntEqHeterogC proof).
+        # Uses cost_dip_multiplicative: C^E(α) = C(α)·[1+δ_baseline−δ_dip·bump(α)].
+        # The multiplicative form ensures K^E(0) = Π^E automatically (since C(0)=0),
+        # so the constraint K^E(0) = Π^E is a *property of the form* rather than
+        # a tuning target that conflicts with the rprime branch.
         **_DEFAULT_INC_BASELINE,
         'has_entry': True,
         'PiE': 0.2,
-        'cfunE_kind': 'cost_dip_gaussian',
+        'cfunE_kind': 'cost_dip_multiplicative',
         'cfunE_params': {
-            # Three constraints to balance:
-            #   (i)   K^E monotone:  delta_dip ≤ K'(α_c−σ)·σ/0.607.
-            #   (ii)  K^E ≥ K_inc in Region II (α₁,α₂):
-            #         delta_baseline ≥ delta_dip · exp(−(α₁−α_c)²/(2σ²)).
-            #   (iii) Enough dip and high enough α_c so entrants enter at
-            #         mid-pooling and cream-skim → badleftoverE > badleftover.
-            # K'(α)=18α+0.2.  Picking α_c=0.25, σ=0.05:
-            #   (i)  K'(0.20)·0.05/0.607 ≈ 3.8·0.082 = 0.313  ⇒ dip ≤ 0.31.
-            #   (ii) bump(α₁=0.346) = exp(−(0.096)²/0.005)=0.158, so
-            #         baseline ≥ 0.30·0.158 = 0.047  ⇒ baseline = 0.10 safe.
+            # α_c=0.25, σ=0.05: cream-skim band centered just below α₁=0.346.
+            # δ_dip=0.40, δ_baseline=0.10:
+            #   multiplier at α_c = 0.70 → C^E(α_c) = 0.70·C(α_c)
+            #   multiplier at α₁  ≈ 1.04 → K^E > K_inc on (α₁,α₂) ⇒ no CIM entry
+            #   multiplier at α=0 → C^E(0) = 0 ⇒ K^E(0) = Π^E exactly
             'alpha_center': 0.25,
             'sigma': 0.05,
-            'delta_dip': 0.30,
+            'delta_dip': 0.40,
             'delta_baseline': 0.10,
         },
     },
@@ -279,7 +271,7 @@ def _resolve_cfunE_mode(cfg):
 
     if kind in ('cost_reduction_top', 'cost_reduction_low',
                 'cost_offset_smooth', 'cost_dip_gaussian',
-                'cost_exp_decay'):
+                'cost_dip_multiplicative', 'cost_exp_decay'):
         # New kinds — handled directly in cfunE, no legacy mode.
         return kind, params
 
@@ -672,6 +664,25 @@ def cfunE(alpha):
         bump = np.exp(-(alpha_arr - alpha_center)**2 / (2.0 * sigma**2))
         offset = delta_baseline - delta_dip * bump
         ca = c_inc + offset
+        return _scalar(ca[0]) if len(alpha_arr) == 1 else ca
+
+    # --- cost_dip_multiplicative: same Gaussian shape as cost_dip_gaussian
+    # but applied multiplicatively, so C^E(0) = 0·(anything) = 0 = C(0) and
+    # therefore K^E(0) = Π^E by construction.
+    # C^E(α) = C(α) · [1 + δ_baseline − δ_dip · exp(−(α−α_c)²/(2σ²))]
+    # At α=0 (far from α_c): C^E ≈ C·(1+δ_baseline), but C(0)=0 ⇒ C^E(0)=0.
+    # At α=α_c: C^E = C·(1+δ_baseline−δ_dip) (cream-skim band).
+    # At α far from α_c on the right: C^E → C·(1+δ_baseline) (no CIM entry).
+    if mode == 'cost_dip_multiplicative':
+        alpha_arr = np.atleast_1d(np.asarray(alpha, dtype=float))
+        alpha_center = params['alpha_center']
+        sigma = params['sigma']
+        delta_dip = params['delta_dip']
+        delta_baseline = params.get('delta_baseline', 0.0)
+        c_inc = np.array([_scalar(cfun(a)) for a in alpha_arr])
+        bump = np.exp(-(alpha_arr - alpha_center)**2 / (2.0 * sigma**2))
+        multiplier = 1.0 + delta_baseline - delta_dip * bump
+        ca = c_inc * multiplier
         return _scalar(ca[0]) if len(alpha_arr) == 1 else ca
 
     # --- polynomial closed form ---
