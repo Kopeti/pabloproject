@@ -75,12 +75,17 @@ PARAM_CONFIGS = {
     },
     'FIG8_bigdata': {
         'description': 'Figure 8 / fig:AIintermediateInnovation - big data: C^E<C for alpha>alpha_hat.',
-        # Setup chosen so K^E starts above K (Π^E > Π = 0.2), is flatter at high
-        # α (λ < 1 multiplicative reduction), and crosses K only at a relatively
-        # high α (around α ≈ 0.5, within the CIM region, before NS).
-        # alpha_hat = 0.55 puts the transition near the NS boundary; the crossover
-        # point K^E = K_inc then falls around α ≈ 0.5.
-        **_DEFAULT_INC_BASELINE,
+        # Aligned with fig9a/fig9b: Pi=0.235 so all three figures share the same
+        # incumbent equilibrium (alpha0=0.056, alpha1=0.351, alpha2=0.633).
+        # PiE=0.5 keeps entrants more expensive at low/mid alpha; the
+        # multiplicative reduction w(alpha) drops C^E below C for alpha > alpha_hat.
+        # At this calibration: alpha2E ≈ 0.79 > alpha2 (Region II extended to the
+        # right, no Region IIb), r_NS drop ≈ 0.43 (positive spillover to NS).
+        # alpha_hat = 0.55 puts the transition inside Region II.
+        'Pi': 0.235,
+        'beta': 0.5,
+        'BperG': 1.0,
+        'cfun': lambda alpha: 9.0 * alpha**2 + 0.2 * alpha,
         'has_entry': True,
         'PiE': 0.5,
         'cfunE_kind': 'cost_reduction_top',
