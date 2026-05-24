@@ -138,7 +138,15 @@ def panel_r_omega(specs, title, filename, annotations=None):
     ax.grid(alpha=0.3); ax.legend(fontsize=9, loc='best')
 
     if annotations:
+        # Extend y-axis so the region labels live in a clear strip above
+        # every rate curve (including the green dashed incumbent NS plateau
+        # in region III).
         ymin, ymax = ax.get_ylim()
+        yrange = ymax - ymin
+        ymax_new = ymax + 0.14 * yrange
+        ax.set_ylim(ymin, ymax_new)
+        label_y = ymax + 0.06 * yrange  # above the curves' top, below new ymax
+
         for omega_value, _ in annotations.get('vlines', []):
             ax.axvline(omega_value, color='gray', ls=':', lw=0.8, alpha=0.7)
         # Replace the default x-axis ticks with the annotation positions
@@ -150,8 +158,8 @@ def panel_r_omega(specs, title, filename, annotations=None):
         ax.set_xticks([t for t, _ in named_ticks])
         ax.set_xticklabels([l for _, l in named_ticks])
         for omega_center, label in annotations.get('regions', []):
-            ax.text(omega_center, ymax - 0.04 * (ymax - ymin), label,
-                    ha='center', va='top', fontsize=11, color='dimgray',
+            ax.text(omega_center, label_y, label,
+                    ha='center', va='center', fontsize=11, color='dimgray',
                     fontweight='bold')
 
     _save(fig, filename)

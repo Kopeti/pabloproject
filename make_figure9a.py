@@ -21,11 +21,19 @@ def main():
     vlines = [(omega_1, r'$\omega_1$'), (omega_2, r'$\omega_2$')]
     if omega_H is not None:
         vlines.append((omega_H, r'$\omega_H$'))
+    # Split Region II at ω_H into IIa (no entrant CIM) and IIb (entrant CIM).
+    if omega_H is not None:
+        region_labels = [(omega_1 / 2, 'I'),
+                         ((omega_1 + omega_H) / 2, 'IIa'),
+                         ((omega_H + omega_2) / 2, 'IIb'),
+                         ((omega_2 + 1) / 2, 'III')]
+    else:
+        region_labels = [(omega_1 / 2, 'I'),
+                         ((omega_1 + omega_2) / 2, 'II'),
+                         ((omega_2 + 1) / 2, 'III')]
     omega_annotations = {
         'vlines': sorted(vlines, key=lambda t: t[0]),
-        'regions': [(omega_1 / 2, 'I'),
-                    ((omega_1 + omega_2) / 2, 'II'),
-                    ((omega_2 + 1) / 2, 'III')],
+        'regions': region_labels,
     }
 
     specs = [
