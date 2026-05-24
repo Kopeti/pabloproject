@@ -17,15 +17,21 @@ def main():
     beta = res['config']['beta']
     omega_1 = omega_g(res['alpha1'], beta)
     omega_2 = omega_g(res['alpha2'], beta)
-    omega_H = find_omega_H(res)
+    # IIa/IIb boundary: ω_g(α₂^E).  In Region IIa (ω₁, ω₂^E) the entrant
+    # tracks the incumbent's CIM rate; in Region IIb (ω₂^E, ω₂) the entrant
+    # has switched to its NS rate, while the incumbent's CIM rate keeps
+    # rising — visible divergence of the curves.
+    has_IIb = res['alpha2E'] < res['alpha2'] - 1e-3
+    omega_2E = omega_g(res['alpha2E'], beta) if has_IIb else None
+
     vlines = [(omega_1, r'$\omega_1$'), (omega_2, r'$\omega_2$')]
-    if omega_H is not None:
-        vlines.append((omega_H, r'$\omega_H$'))
-    # Split Region II at ω_H into IIa (no entrant CIM) and IIb (entrant CIM).
-    if omega_H is not None:
+    if has_IIb:
+        vlines.append((omega_2E, r"$\omega_2^E$"))
+
+    if has_IIb:
         region_labels = [(omega_1 / 2, 'I'),
-                         ((omega_1 + omega_H) / 2, 'IIa'),
-                         ((omega_H + omega_2) / 2, 'IIb'),
+                         ((omega_1 + omega_2E) / 2, 'IIa'),
+                         ((omega_2E + omega_2) / 2, 'IIb'),
                          ((omega_2 + 1) / 2, 'III')]
     else:
         region_labels = [(omega_1 / 2, 'I'),
