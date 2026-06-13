@@ -1246,6 +1246,226 @@ def plot_cumulative_lending(params, nested, iid):
     return fig
 
 
+# =============================================================================
+# DENSITY-EVOLUTION FIGURE  (panels (e,f) of fig:density in the draft)
+# =============================================================================
+#
+# Reproduces the MATLAB `densities` figure (secondversion/main.m): the pool of
+# good / bad borrowers a lender of skill alpha faces, after every lower-skill
+# lender in the Region-I queue has progressively depleted it.  The depletion
+# recursion is identical to the one inside solve_nested (line ~219); here we
+# additionally snapshot the full densities g(omega), b(omega) at a set of alpha
+# values so they can be plotted.
+
+def nested_density_snapshots(params, n_curves=6, delom=None):
+    """Run the nested Region-I depletion recursion, storing snapshots of the
+    good/bad densities at n_curves alpha values spanning [alpha0, alpha1].
+
+    A snapshot is taken *after* the lenders of skill alpha have acted and is
+    labelled by that alpha, matching the MATLAB convention (first curve =
+    alpha_0, last curve = alpha_1).
+
+    delom must be fine enough to resolve the per-step slivers of width
+    Delta*min(beta, 1-beta); too coarse a grid makes the solver over-deplete
+    (curves collapse to 0/1).  Defaults to params.delom (same as solve_nested).
+    """
+    global _current_params
+    _current_params = params
+    Pi, beta, BperG = params.Pi, params.beta, params.BperG
+    Delta = params.Delta
+    if delom is None:
+        delom = params.delom
+
+    # alpha0, rp, alpha1 -- identical to solve_nested
+    res = minimize_scalar(
+        lambda a: (Pi + cfun(a) + 1) / gam0(a, params) if 0 < a < 1 else 1e10,
+        bounds=(0.01, 0.99), method='bounded')
+    alpha0 = res.x
+    rp = (Pi + cfun(alpha0) + 1) / gam0(alpha0, params) - 1
+    if rp - cfun(1) > Pi:
+        alpha1 = 1.0
+    else:
+        alpha1 = brentq(lambda a: cfun(a) - (rp - Pi), 0.01, 0.99)
+
+    n_om = int(round(1 / delom))
+    omvec = np.linspace(0, 1, n_om)
+    g, b = gpriorfun(omvec), bpriorfun(omvec, BperG)
+    D_rp = dfun(rp)
+
+    targets = np.linspace(alpha0, alpha1, n_curves)
+    g_snaps, b_snaps, snap_alphas = [], [], []
+    ti = 0
+
+    alpha = alpha0
+    while alpha + Delta <= alpha1 + 1e-8:
+        acting = alpha
+        omega_g_alp = beta + alpha * (1 - beta)
+        omega_b_alp = 1 - beta + alpha * beta
+        mask_g, mask_b = omvec <= omega_g_alp, omvec >= omega_b_alp
+        G_alp = np.sum(delom * g[mask_g])
+        B_alp = np.sum(delom * b[mask_b])
+        T_alp = G_alp + B_alp
+        if T_alp < 1e-10:
+            break
+
+        alpha_next = min(alpha + Delta, alpha1)
+        req_gamma = (1 + Pi + cfun(alpha_next)) / (1 + rp)
+        omega_g_next = beta + alpha_next * (1 - beta)
+        omega_b_next = 1 - beta + alpha_next * beta
+
+        def gamma_after_w(w, mask_g=mask_g, mask_b=mask_b, T_alp=T_alp):
+            scale = w / (T_alp * D_rp)
+            if scale >= 1:
+                return 1.0
+            g_new = g * (1 - mask_g * scale)
+            b_new = b * (1 - mask_b * scale)
+            G_n = np.sum(delom * g_new[omvec <= omega_g_next])
+            B_n = np.sum(delom * b_new[omvec >= omega_b_next])
+            return G_n / (G_n + B_n) if G_n + B_n > 1e-10 else 1.0
+
+        g0v, gmax = gamma_after_w(0), gamma_after_w(T_alp * D_rp * 0.999)
+        if req_gamma <= g0v:
+            w_opt = 0.0
+        elif req_gamma >= gmax:
+            w_opt = T_alp * D_rp * 0.999
+        else:
+            w_opt = brentq(lambda w: gamma_after_w(w) - req_gamma,
+                           0, T_alp * D_rp * 0.999)
+
+        scale = w_opt / (T_alp * D_rp)
+        g = g * (1 - mask_g * scale)
+        b = b * (1 - mask_b * scale)
+        alpha = alpha_next
+
+        # snapshot once the acting skill reaches the next target alpha
+        while ti < n_curves and acting >= targets[ti] - 1e-9:
+            g_snaps.append(g.copy())
+            b_snaps.append(b.copy())
+            snap_alphas.append(acting)
+            ti += 1
+
+    # ensure the final (alpha ~ alpha1) state is captured as the last curve
+    while ti < n_curves:
+        g_snaps.append(g.copy())
+        b_snaps.append(b.copy())
+        snap_alphas.append(alpha)
+        ti += 1
+
+    return dict(omvec=omvec, alphas=np.array(snap_alphas),
+                g_snaps=g_snaps, b_snaps=b_snaps,
+                alpha0=alpha0, alpha1=alpha1, rp=rp, beta=beta)
+
+
+def _draw_density_panel(ax, omvec, snaps, alphas, beta, kind, thr0, thr1,
+                        thr0_lab, thr1_lab, ylabel, ylim_top,
+                        fs_label=16, fs_tick=13, fs_leg=12, fs_thr=12,
+                        leg_loc='best'):
+    """Draw one density panel (bad or good) onto ax, styled to match the
+    TikZ panels of fig:density (red = alpha_0 .. green = alpha_1, line width
+    increasing with skill, dotted threshold lines)."""
+    n = len(alphas)
+    c_lo = np.array([0.84, 0.10, 0.11])   # red  (alpha_0, least skilled)
+    c_hi = np.array([0.00, 0.39, 0.00])   # green!60!black (alpha_1)
+    lws = np.linspace(1.1, 2.8, n)
+
+    labels = [r'$\alpha=\alpha_0$']
+    labels += [rf'$\alpha={a:.2f}$' for a in alphas[1:-1]]
+    labels += [r'$\alpha=\alpha_1$']
+
+    for i in range(n):
+        col = tuple(c_lo + (c_hi - c_lo) * (i / (n - 1) if n > 1 else 0))
+        ax.plot(omvec, snaps[i], color=col, lw=lws[i], label=labels[i])
+
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, ylim_top)
+    ax.set_xlabel(r'$\omega$', fontsize=fs_label)
+    ax.set_ylabel(ylabel, fontsize=fs_label)
+    ax.tick_params(labelsize=fs_tick)
+
+    # threshold lines + labels (staggered top/bottom as in the MATLAB figure)
+    for x, lab, where in ((thr0, thr0_lab, 'bottom' if kind == 'bad' else 'top'),
+                          (thr1, thr1_lab, 'top' if kind == 'bad' else 'bottom')):
+        ax.axvline(x, color='0.35', ls=':', lw=0.8)
+        y = ylim_top * 0.96 if where == 'top' else ylim_top * 0.04
+        va = 'top' if where == 'top' else 'bottom'
+        ax.text(x, y, lab, fontsize=fs_thr, ha='center', va=va,
+                bbox=dict(boxstyle='round,pad=0.1', fc='white', ec='none',
+                          alpha=0.75))
+
+    ax.legend(loc=leg_loc, fontsize=fs_leg, framealpha=0.85)
+
+
+def plot_density_panels(params, save_dir=None, n_curves=6, figsize=(3.8, 4.0),
+                        cost=None):
+    """Generate the two density panels (bad pool, good pool) as separate vector
+    PDFs, sized to drop into fig:density as panels (e) and (f).
+
+    Saves densities_bad.pdf and densities_good.pdf into save_dir (defaults to
+    the draft folder Peter-Pablo-Maryam/draft, falling back to the script dir).
+    Returns (fig_bad, fig_good).
+
+    cost, if given as (C2, P2, C1, P1), temporarily overrides the module cost
+    constants for this figure only (the cost enters only via
+    nested_density_snapshots).  This lets the density figure use the figs-8/9
+    calibration (beta=0.5 etc.) while the other credit_model.py figures keep
+    the Parameters() baseline.
+    """
+    import os
+    global COST_C2, COST_P2, COST_C1, COST_P1
+    if cost is not None:
+        _saved_cost = (COST_C2, COST_P2, COST_C1, COST_P1)
+        COST_C2, COST_P2, COST_C1, COST_P1 = cost
+        try:
+            snaps = nested_density_snapshots(params, n_curves=n_curves)
+        finally:
+            COST_C2, COST_P2, COST_C1, COST_P1 = _saved_cost
+    else:
+        snaps = nested_density_snapshots(params, n_curves=n_curves)
+    omvec = snaps['omvec']
+    alphas = snaps['alphas']
+    alpha0, alpha1, beta = snaps['alpha0'], snaps['alpha1'], snaps['beta']
+    BperG = params.BperG
+
+    og0, og1 = beta + (1 - beta) * alpha0, beta + (1 - beta) * alpha1
+    ob0, ob1 = (1 - beta) + beta * alpha0, (1 - beta) + beta * alpha1
+
+    # --- Bad pool ---
+    figB, axB = plt.subplots(figsize=figsize)
+    _draw_density_panel(
+        axB, omvec, snaps['b_snaps'], alphas, beta, kind='bad',
+        thr0=ob0, thr1=ob1,
+        thr0_lab=r'$\omega_b(\alpha_0)$', thr1_lab=r'$\omega_b(\alpha_1)$',
+        ylabel=r'$b(\omega;r_p,1,\alpha)$', ylim_top=1.5 * BperG,
+        leg_loc='upper left')
+    figB.tight_layout()
+
+    # --- Good pool ---
+    figG, axG = plt.subplots(figsize=figsize)
+    _draw_density_panel(
+        axG, omvec, snaps['g_snaps'], alphas, beta, kind='good',
+        thr0=og0, thr1=og1,
+        thr0_lab=r'$\omega_g(\alpha_0)$', thr1_lab=r'$\omega_g(\alpha_1)$',
+        ylabel=r'$g(\omega;r_p,1,\alpha)$', ylim_top=1.25,
+        leg_loc='upper left')
+    figG.tight_layout()
+
+    # resolve output directory: draft folder if reachable, else script dir
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    if save_dir is None:
+        draft = os.path.normpath(os.path.join(
+            script_dir, '..', '..', '..', '..', 'Peter-Pablo-Maryam', 'draft'))
+        save_dir = draft if os.path.isdir(draft) else script_dir
+
+    path_b = os.path.join(save_dir, 'densities_bad.pdf')
+    path_g = os.path.join(save_dir, 'densities_good.pdf')
+    figB.savefig(path_b, bbox_inches='tight')
+    figG.savefig(path_g, bbox_inches='tight')
+    print(f"Density panels saved to:\n  {path_b}\n  {path_g}")
+    print(f"  alpha0={alpha0:.4f}, alpha1={alpha1:.4f}, "
+          f"snapshot alphas={np.round(alphas, 3)}")
+    return figB, figG
+
+
 def main():
     """Main function to run the model comparison."""
     params = Parameters()
@@ -1309,6 +1529,14 @@ def main():
     output_path2 = os.path.join(script_dir, 'credit_model_lending.png')
     fig2.savefig(output_path2, dpi=150, bbox_inches='tight')
     print(f"Lending plot saved to {output_path2}")
+
+    # Density-evolution panels (e,f) of fig:density in the draft.
+    # Uses the figs-8/9 calibration (Pi=0.235, beta=0.5, BperG=1.0,
+    # cfun=9a^2+0.2a) -- beta=0.5 gives wide omega acceptance bands so the
+    # cleansing gradient is legible, and matches the entry/spillover figures.
+    print("\n--- Creating Density Panels (fig:density e,f) ---")
+    plot_density_panels(Parameters(Pi=0.235, beta=0.5, BperG=1.0),
+                        cost=(9.0, 2.0, 0.2, 1.0))
 
     # Compare analytical vs discrete for current parameters
     compare_analytical_vs_discrete(params)
