@@ -150,6 +150,26 @@ PARAM_CONFIGS = {
     },
 }
 
+def _plateau_cost_cached():
+    """Lazily build (and cache) the ironing-demo plateau cost from credit_model."""
+    if not hasattr(_plateau_cost_cached, '_fns'):
+        from credit_model import plateau_cost_factory
+        _plateau_cost_cached._fns = plateau_cost_factory(lam=0.15)
+    return _plateau_cost_cached._fns
+
+
+PARAM_CONFIGS['IRONING_demo'] = {
+    'description': ('Ironing demo - plateau cost (C-prime shrunk to 15% of '
+                    '9a^2+0.2a slope on [0.15,0.25]); activates the Region-I '
+                    'ironing branch (no-entry interval ~[0.081,0.224]). '
+                    'Baseline only.'),
+    'Pi': 0.235,
+    'beta': 0.5,
+    'BperG': 1.0,
+    'cfun': lambda alpha: _plateau_cost_cached()[0](alpha),
+    'has_entry': False,
+}
+
 # Default config for direct execution; can be overridden by --config CLI flag.
 ACTIVE_CONFIG = 'FIG9_OB_limited'
 
@@ -984,11 +1004,58 @@ def fifunE(al, al2):
         return fi
 
 
+def _band_capital(al_start, n_pts=100):
+    """Total capital required along the Region-IIb band [al_start, alpha2].
+
+    Integrates the non-selective density (eq:wNSE-proof) plus the top-market
+    term (draft Step 8).  phi is forced weakly decreasing: on sub-intervals
+    where the raw slice-clearing ratio (fifunE) would rise, the non-selective
+    threat is not binding — no NS capital enters there, phi is held flat and
+    those markets clear at the incumbent capital-clearing rate below rtilde
+    (the min/max fallback stated in Step 8 of the repaired proof).  No shipped
+    calibration triggers the fallback; a message is printed when it fires.
+    """
+    vec = np.linspace(al_start, g.alpha2, n_pts)
+    fivec = np.asarray(fifunE(vec, al_start), dtype=float)
+    fivec_mono = np.minimum.accumulate(fivec)
+    if np.any(fivec - fivec_mono > 1e-10):
+        print("  [band fallback] phi non-monotone on part of the band: NS "
+              "threat not binding there; phi held flat, NS density zeroed.")
+    fivec = fivec_mono
+    upper_limits = g.beta + vec[:-1] * (1 - g.beta)
+    Gvec = g.badleftoverE + np.array([
+        quad(gpriorfun_scalar, ul, 1)[0] for ul in upper_limits
+    ])
+    rtilde_vec = np.array([_scalar(rtildeafunE(v, al_start)) for v in vec[:-1]])
+    WNSvec = -np.diff(fivec) / np.diff(vec) * Gvec * dfun(rtilde_vec)
+    WNSEattop = (fivec[-1] *
+                 (g.badleftoverE + quad(gpriorfun_scalar,
+                                        g.beta + g.alpha2 * (1 - g.beta), 1)[0]) *
+                 _scalar(dfun(rtildeafunE(g.alpha2, al_start))))
+    return np.sum(WNSvec * np.diff(vec)) + WNSEattop
+
+
+def _incumbent_cim_rate(al):
+    """Incumbent-side comparator for entry in the CIM region (draft Step 9).
+
+    On (alpha_1^E, alpha_1] the incumbents' rate is the cash-in-the-market
+    rate rhat — their capital is sunk at pooling-era levels and bears no
+    relation to K there — so the entry trigger compares K^E against rhat
+    (audit item 4.2).  On (alpha_1, alpha_2] market clearing gives
+    rhat = K(alpha), so K is the comparator, as before.
+    """
+    al = _scalar(al)
+    if al <= g.alpha1 and hasattr(g, 'rhat'):
+        ind = int(np.argmin((al - g.almassshort) ** 2))
+        return _scalar(g.rhat[ind])
+    return _scalar(cfun(al)) + g.Pi
+
+
 def wcimE(al):
     """Wealth difference in CIM region for new entrants. Matches wcimE.m"""
     al = np.atleast_1d(np.asarray(al, dtype=float))
     if len(al) == 1:
-        c_inc = _scalar(cfun(al[0])) + g.Pi
+        c_inc = _incumbent_cim_rate(al[0])
         c_ent = _scalar(cfunE(al[0])) + g.PiE
         if c_inc > c_ent:
             return ((_scalar(dfun(c_ent)) - _scalar(dfun(c_inc))) *
@@ -998,7 +1065,7 @@ def wcimE(al):
     else:
         w = np.zeros(len(al))
         for i in range(1, len(al)):
-            c_inc = _scalar(cfun(al[i])) + g.Pi
+            c_inc = _incumbent_cim_rate(al[i])
             c_ent = _scalar(cfunE(al[i])) + g.PiE
             if c_inc > c_ent:
                 w[i] = ((_scalar(dfun(c_ent)) - _scalar(dfun(c_inc))) *
@@ -1020,9 +1087,11 @@ def rfunE(al, al0, al1, al2):
         elif al[i] <= al1:
             r[i] = g.rpE
         elif al[i] <= g.alpha1:
+            # Step 9: r_CIM^E = min(rhat, K^E) — the K^E cap was missing
+            # (audit item 4.1); moot in the shipped calibrations.
             diffs = (al[i] - g.almassshort)**2
             ind = np.argmin(diffs)
-            r[i] = g.rhat[ind]
+            r[i] = min(_scalar(g.rhat[ind]), _scalar(cfunE(al[i])) + g.PiE)
         elif al[i] <= min(al2, g.alpha2):
             r[i] = min(_scalar(cfun(al[i])) + g.Pi, _scalar(cfunE(al[i])) + g.PiE)
         elif al[i] <= g.alpha2:
@@ -1081,12 +1150,30 @@ def run_baseline():
     # =====================================================================
     # Find alpha0 and rp
     # =====================================================================
+    # Bounded Brent first (kept verbatim — bit-identical to legacy behavior),
+    # overridden only if a grid scan proves Brent landed in a local minimum
+    # (non-convex costs, e.g. the IRONING_demo plateau cost).
+    _obj0 = lambda alpha: (g.Pi + _scalar(cfun(alpha)) + 1) / gam0(alpha)
     res = minimize_scalar(
-        lambda alpha: (g.Pi + _scalar(cfun(alpha)) + 1) / gam0(alpha),
+        _obj0,
         bounds=(0.01, 0.99), method='bounded'
     )
     g.alpha0 = res.x
-    g.rp = (g.Pi + _scalar(cfun(g.alpha0)) + 1) / gam0(g.alpha0) - 1
+    _grid0 = np.linspace(0.01, 0.99, 400)
+    _vals0 = np.array([_obj0(a) for a in _grid0])
+    _k0 = int(np.argmin(_vals0))
+    if _vals0[_k0] < _obj0(g.alpha0) - 1e-12:
+        res2 = minimize_scalar(
+            _obj0,
+            bounds=(_grid0[max(_k0 - 1, 0)],
+                    _grid0[min(_k0 + 1, len(_grid0) - 1)]),
+            method='bounded'
+        )
+        if _obj0(res2.x) < _obj0(g.alpha0):
+            print(f"  [alpha0] Brent local minimum at {g.alpha0:.4f} "
+                  f"overridden by global minimum near {res2.x:.4f}")
+            g.alpha0 = res2.x
+    g.rp = _obj0(g.alpha0) - 1
 
     print(f"  alpha0 = {g.alpha0:.6f}")
     print(f"  rp     = {g.rp:.6f}")
@@ -1149,7 +1236,26 @@ def run_baseline():
 
     # w(alpha) = theta * D(rp) * T
     w_vals = theta_vals * D_rp * T_vals
-    w_vals = np.maximum(w_vals, 0)
+
+    # Ironing (Appendix "Ironing" of the draft): where the closed-form density
+    # would be negative, the equilibrium has no-entry intervals with an
+    # undepleted pool.  Shared implementation lives in credit_model (general
+    # priors; this caller's arrays are uniform-prior by construction).  On the
+    # shipped calibrations the branch is an inactive passthrough.
+    from credit_model import iron_region1
+    _ironing = iron_region1(alphas, K_vals, g.rp, beta, g_tilde, B0_tilde,
+                            T_vals, G_vals, B_vals, E_vals, w_vals, da)
+    if _ironing['active']:
+        w_vals = _ironing['w']
+        T_vals, G_vals, B_vals = _ironing['T'], _ironing['G'], _ironing['B']
+        E_vals = _ironing['E']
+        Gamma = _ironing['gamma']       # realized pool quality (= Gamma outside)
+        theta_vals = _ironing['theta']
+        print(f"  [ironing] active: no-entry intervals "
+              f"{[(round(a, 4), round(b, 4)) for (a, b) in _ironing['intervals']]}")
+    g.ironing_active = _ironing['active']
+    g.no_entry_intervals = _ironing['intervals']
+    w_vals = np.maximum(w_vals, 0)  # numerical dust only; negativity handled above
 
     # Cumulative capital in Region I
     W_cumsum_R1 = np.zeros_like(alphas)
@@ -1370,6 +1476,7 @@ def solve_entry_pooling_analytical(rpE, alpha0E, alpha1E, n_pts=500,
             'gammaE': np.ones_like(alphas), 'theta': np.zeros_like(alphas),
             'KE': KE, 'KE_prime': KE_prime,
             'WE_cumsum': np.zeros_like(alphas),
+            'suspended_intervals': [], 'suspension_diags': [],
         }
 
     # T^E formula (eq. 4 from entry_Talpha_construction.tex)
@@ -1427,8 +1534,70 @@ def solve_entry_pooling_analytical(rpE, alpha0E, alpha1E, n_pts=500,
                                 (1 - beta) * gpriorfun_scalar(beta + a_j * (1 - beta)))
     w_incumbent = w_inc_pooling + w_inc_cim
 
-    # Entry density (ironed: entrants only where total exceeds incumbent)
+    # Entry density: entrants active only where the zero-profit total exceeds
+    # the incumbent floor (Step 6 of the entry proof).
     wE = np.maximum(0, w_total - w_incumbent)
+
+    # --- Entry-side Step-6 forward pass -----------------------------------
+    # On suspended stretches (total required < incumbent floor) the pool does
+    # NOT follow the zero-profit closed form: incumbents keep lending, so the
+    # state (G^E, B^E) evolves by incumbent-only depletion at r_pE.  Propagate
+    # it, overwrite the state arrays there, and report (i) the entrant-profit
+    # residual inside (the text's Step 6 notes incumbent capital alone may
+    # generate excess quality, i.e. a positive residual — the boundary
+    # adjustment for that case runs through Step 3's alpha1'E, not here) and
+    # (ii) the state mismatch where the closed form resumes.
+    suspended = w_total < w_incumbent
+    suspended_intervals = []
+    suspension_diags = []
+    if np.any(suspended) and not np.all(suspended):
+        Gamma_req_E = (1 + KE) / (1 + rpE)
+        j = 0
+        n_g = len(alphas)
+        while j < n_g:
+            if not suspended[j]:
+                j += 1
+                continue
+            s = j
+            while j < n_g and suspended[j]:
+                j += 1
+            e = j  # suspension on [s, e)
+            G_st = GE[s - 1] if s > 0 else GE[0]
+            B_st = BE[s - 1] if s > 0 else BE[0]
+            max_resid = -np.inf
+            for k in range(s, e):
+                T_st = G_st + B_st
+                th_inc = (w_incumbent[k] / (D_rpE * T_st)) if T_st > 1e-15 else 0.0
+                E_st = B_st / max(B0_tilde[k], 1e-15)
+                G_next = (1 - th_inc * da) * G_st + (1 - beta) * g_tilde[k] * da
+                B_next = (1 - th_inc * da) * B_st - beta * b_tilde[k] * E_st * da
+                G_st, B_st = max(G_next, 0.0), max(B_next, 0.0)
+                GE[k], BE[k] = G_st, B_st
+                EE[k] = B_st / max(B0_tilde[k], 1e-15)
+                TE[k] = G_st + B_st
+                gam_k = G_st / TE[k] if TE[k] > 1e-15 else 1.0
+                gammaE[k] = gam_k
+                max_resid = max(max_resid, gam_k - Gamma_req_E[k])
+            if e < n_g:
+                mismatch = (abs(G_st - GE[e]) / max(abs(GE[e]), 1e-15),
+                            abs(B_st - BE[e]) / max(abs(BE[e]), 1e-15))
+            else:
+                mismatch = None
+            suspended_intervals.append((float(alphas[s]),
+                                        float(alphas[min(e, n_g - 1)])))
+            suspension_diags.append({
+                'max_entrant_profit_resid': float(max_resid),
+                'state_mismatch_at_resume': mismatch,
+            })
+        print(f"  Entry Step-6: suspended stretches "
+              f"{[(round(a, 4), round(b, 4)) for (a, b) in suspended_intervals]}")
+        for d_ in suspension_diags:
+            print(f"    max entrant-profit residual inside: "
+                  f"{d_['max_entrant_profit_resid']:.3e}"
+                  + (f"; state mismatch at resume (G,B): "
+                     f"({d_['state_mismatch_at_resume'][0]:.2e}, "
+                     f"{d_['state_mismatch_at_resume'][1]:.2e})"
+                     if d_['state_mismatch_at_resume'] else ""))
 
     # Cumulative entry capital
     WE_cumsum = np.zeros_like(alphas)
@@ -1464,6 +1633,8 @@ def solve_entry_pooling_analytical(rpE, alpha0E, alpha1E, n_pts=500,
         'KE': KE,
         'KE_prime': KE_prime,
         'WE_cumsum': WE_cumsum,
+        'suspended_intervals': suspended_intervals,
+        'suspension_diags': suspension_diags,
     }
 
 
@@ -1817,39 +1988,34 @@ def run_mainE():
             WNSE = 0.0
             print('  >> rNS goes up, no NS entry')
         else:
-            # Bisection to find alpha2E
-            err = 1.0
-            alpha_low = g.alpha1E
-            alpha_high = g.alpha2
-            alit = (alpha_low + alpha_high) / 2.0
-
-            while abs(err) > 0.0001:
-                vec = np.linspace(alit, g.alpha2, 100)
-                fivec = fifunE(vec, alit)
-
-                upper_limits = g.beta + vec[:-1] * (1 - g.beta)
-                Gvec = g.badleftoverE + np.array([
-                    quad(gpriorfun_scalar, ul, 1)[0] for ul in upper_limits
-                ])
-
-                rtilde_vec = np.array([_scalar(rtildeafunE(v, alit)) for v in vec[:-1]])
-                WNSvec = -np.diff(fivec) / np.diff(vec) * Gvec * dfun(rtilde_vec)
-                WNSEattop = (fivec[-1] *
-                             (g.badleftoverE + quad(gpriorfun_scalar,
-                                                    g.beta + g.alpha2 * (1 - g.beta), 1)[0]) *
-                             _scalar(dfun(rtildeafunE(g.alpha2, alit))))
-                WNSE_iter = np.sum(WNSvec * np.diff(vec)) + WNSEattop
-
-                err = g.WNS - WNSE_iter
-
-                if err > 0:
-                    alpha_high = alit
-                else:
-                    alpha_low = alit
-
+            # Case A (Step 8): alpha2E pinned by capital clearing of the
+            # reallocated incumbent non-selective capital w^NS.
+            if _band_capital(g.alpha1E) < g.WNS:
+                # Corner (text Step 8, Case A): even the maximal band cannot
+                # absorb w^NS; the residual incumbent NS capital forms an atom
+                # at the top market.
+                print('  [corner] Case A: required capital at the maximal band '
+                      'is below w^NS; residual incumbent NS capital forms an '
+                      'atom at the top market; alpha2E = alpha1E')
+                g.alpha2E = g.alpha1E
+            else:
+                # Bisection to find alpha2E
+                err = 1.0
+                alpha_low = g.alpha1E
+                alpha_high = g.alpha2
                 alit = (alpha_low + alpha_high) / 2.0
 
-            g.alpha2E = alit
+                while abs(err) > 0.0001:
+                    err = g.WNS - _band_capital(alit)
+
+                    if err > 0:
+                        alpha_high = alit
+                    else:
+                        alpha_low = alit
+
+                    alit = (alpha_low + alpha_high) / 2.0
+
+                g.alpha2E = alit
             WNSE = 0.0
             g.rnsE = _scalar(rtildeafunE(g.alpha2, g.alpha2E))
             print('  >> NS rate goes down, no NS entry before alpha2, incumbents enter before')
@@ -1867,29 +2033,24 @@ def run_mainE():
             )
             alphaNSmax = res_ns.x
 
-            if NSfunE(alphaNSmax) > 0:
+            if NSfunE(alphaNSmax) <= 0:
+                raise RuntimeError(
+                    "Case B (r''-min): NSfunE has no positive region on "
+                    "[alpha1E, 1], inconsistent with the branch hypothesis "
+                    "r'' < min(r''', r_NS); check the calibration.")
+            if NSfunE(g.alpha1E) > 0:
+                # Corner (text Step 8, Case B): the band extends to the lower
+                # boundary of the CIM region.
+                print('  [corner] NSfunE > 0 at alpha1E: Region IIb extends '
+                      'to the CIM lower boundary; alpha2E0 = alpha1E')
+                alpha2E0 = g.alpha1E
+            else:
                 # MATLAB uses fzero (bracket-based); use brentq for reliability
                 alpha2E0 = brentq(NSfunE, g.alpha1E, alphaNSmax)
-            else:
-                alpha2E0 = 1.0
 
-            vec = np.linspace(alpha2E0, g.alpha2, 1000)
-            fivec = fifunE(vec, alpha2E0)
-
-            upper_limits = g.beta + vec[:-1] * (1 - g.beta)
-            Gvec = g.badleftoverE + np.array([
-                quad(gpriorfun_scalar, ul, 1)[0] for ul in upper_limits
-            ])
-
-            rtilde_vec = np.array([_scalar(rtildeafunE(v, alpha2E0)) for v in vec[:-1]])
-            WNSvec = -np.diff(fivec) / np.diff(vec) * Gvec * dfun(rtilde_vec)
-            # Note: MATLAB line 210 has rtildeafunE(vec, alpha2E0) which seems to be
-            # a bug; using scalar alpha2 to match the pattern from the other branch
-            WNSEattop = (fivec[-1] *
-                         (g.badleftoverE + quad(gpriorfun_scalar,
-                                                g.beta + g.alpha2 * (1 - g.beta), 1)[0]) *
-                         _scalar(dfun(rtildeafunE(g.alpha2, alpha2E0))))
-            WNSE_val = np.sum(WNSvec * np.diff(vec)) + WNSEattop
+            # (The retired MATLAB line-210 rtildeafunE vector bug is patched
+            # inside _band_capital, which uses the scalar-alpha2 pattern.)
+            WNSE_val = _band_capital(alpha2E0, n_pts=1000)
 
             if WNSE_val > g.WNS:
                 g.alpha2E = alpha2E0
@@ -1897,7 +2058,11 @@ def run_mainE():
                 WNSE = WNSE_val - g.WNS  # atom of entrant NS capital at rtilde(alpha2)
                 print('  >> NS rate goes down, with NS entry before alpha2')
             else:
-                print('  >> we are on a branch which we guessed did not exist')
+                print('  >> WARNING: numerical-consistency failure: total band '
+                      'capital <= w^NS in Case B. The excess-capital lemma '
+                      '(Step 8 of the repaired proof) rules this out for '
+                      'monotone phi; investigate before trusting results. '
+                      'Falling back to alpha2E = alpha2, rnsE = rprime.')
                 g.alpha2E = g.alpha2
                 g.rnsE = rprime
 
@@ -2042,7 +2207,7 @@ def run_mainE():
             da_cim = cim_ana_al[1] - cim_ana_al[0] if n_cim_ana > 1 else 0
             wE_cim_ana = np.zeros(n_cim_ana)
             for j, a in enumerate(cim_ana_al):
-                r_inc = _scalar(cfun(a)) + g.Pi
+                r_inc = _incumbent_cim_rate(a)
                 r_ent = _scalar(cfunE(a)) + g.PiE
                 g_tilde_j = gpriorfun_scalar(g.beta + a * (1 - g.beta))
                 if r_inc > r_ent:
@@ -2126,7 +2291,7 @@ def run_mainE():
             cim_entry_al = np.linspace(g.alpha1E + 0.001, g.alpha2E, 200)
             wE_cim = np.zeros(len(cim_entry_al))
             for j, a in enumerate(cim_entry_al):
-                r_inc = _scalar(cfun(a)) + g.Pi
+                r_inc = _incumbent_cim_rate(a)
                 r_ent = _scalar(cfunE(a)) + g.PiE
                 g_tilde_j = gpriorfun_scalar(g.beta + a * (1 - g.beta))
                 if r_inc > r_ent:

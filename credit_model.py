@@ -102,6 +102,33 @@ def gam0(alpha, params):
     B, _ = quad(lambda x: bpriorfun(x, BperG), omega_b, 1)
     return G / (G + B)
 
+def find_alpha0(params, n_scan=400, lo=0.01, hi=0.99):
+    """Global argmin of the fresh-pool break-even rate (Pi + C(a) + 1)/gam0(a).
+
+    Runs the original bounded Brent search first and keeps its result verbatim
+    (bit-identical to the legacy behavior) unless a grid scan finds a strictly
+    better value — i.e. Brent, which assumes unimodality, landed in a local
+    minimum (e.g. under the plateau cost used to demonstrate ironing).  Only
+    then is the grid minimum refined and used.
+    """
+    obj = lambda a: (params.Pi + cfun(a) + 1) / gam0(a, params) if 0 < a < 1 else 1e10
+    res = minimize_scalar(obj, bounds=(lo, hi), method='bounded')
+    alpha0 = res.x
+    grid = np.linspace(lo, hi, n_scan)
+    vals = np.array([obj(a) for a in grid])
+    k = int(np.argmin(vals))
+    if vals[k] < obj(alpha0) - 1e-12:
+        # Brent missed the global minimum: refine around the grid argmin.
+        res2 = minimize_scalar(
+            obj, bounds=(grid[max(k - 1, 0)], grid[min(k + 1, n_scan - 1)]),
+            method='bounded')
+        if obj(res2.x) < obj(alpha0):
+            print(f"  [find_alpha0] Brent local minimum at {alpha0:.4f} "
+                  f"overridden by global minimum near {res2.x:.4f}")
+            alpha0 = res2.x
+    rp = obj(alpha0) - 1
+    return alpha0, rp
+
 def NSfun(al, beta, badleftover, Pi, BperG):
     """No-screening equilibrium condition (squared residual)."""
     omega_g = beta + al * (1 - beta)
@@ -132,6 +159,195 @@ def find_alpha2(alpha1, beta, badleftover, Pi, BperG, n_scan=500):
             return alpha2
     return None  # no solution
 
+
+# =============================================================================
+# IRONING (Region I, nested) — Appendix "Ironing" of the draft
+# =============================================================================
+
+def _frozen_tail_violation(i, G_vals, E_vals, B0_tilde, cumG, Gamma_req,
+                           j_min=None):
+    """Max violation of the free-entry bound along the frozen-pool tail from i.
+
+    If entry follows the closed form up to alphas[i] and then stops, the pool
+    at a > alphas[i] evolves with no depletion:
+        G(a; a_i) = G(a_i) + [calG(omega_g(a)) - calG(omega_g(a_i))]
+        B(a; a_i) = E(a_i) * B0_tilde(a)
+    (general priors: the own-slice increment enters through cumG, the bad side
+    through B0_tilde — no uniformity assumed).
+
+    Returns (m, j_tan): m is the max violation of
+    gamma(a; a_i) <= Gamma_req(a) over the whole tail a > a_i (membership test
+    for the set N); j_tan is the argmax restricted to indices >= j_min — the
+    tangency/resumption candidate.  The restriction matters at the component's
+    left edge, where the global max is ~0 and float noise can otherwise pick a
+    spurious adjacent point instead of the interior tangency; the no-entry
+    interval must cover the first infeasible point, so passing j_min = first
+    index with w < 0 is the correct restriction.
+    """
+    G_ir = G_vals[i] + (cumG[i + 1:] - cumG[i])
+    B_ir = E_vals[i] * B0_tilde[i + 1:]
+    gam = G_ir / (G_ir + B_ir)
+    viol = gam - Gamma_req[i + 1:]
+    m = float(np.max(viol))
+    if j_min is None or j_min <= i + 1:
+        j_tan = i + 1 + int(np.argmax(viol))
+    else:
+        j_tan = j_min + int(np.argmax(viol[j_min - (i + 1):]))
+    return m, j_tan
+
+
+def iron_region1(alphas, K_vals, rp, beta, g_tilde, B0_tilde,
+                 T_vals, G_vals, B_vals, E_vals, w_vals, da,
+                 w_tol_rel=1e-8):
+    """Ironing for the closed-form Region-I solution (nested information).
+
+    Where the closed-form entry density w(alpha) would be negative, the
+    equilibrium instead has no-entry intervals: entry stops at a_L, the pool
+    evolves undepleted (own slices accumulate, the bad depletion factor stays
+    frozen at E(a_L)), and entry resumes at a_R.  Per the draft's Ironing
+    appendix, the no-entry intervals are the connected components of
+        N = { a~ : gamma(a; a~) > (1+K(a))/(1+rp) for some a > a~ },
+    where gamma(a; a~) is the frozen-pool quality.  At the left edge a_L the
+    frozen tail stays weakly below the bound with a tangency at a_R; at the
+    tangency both the quality and its slope match the zero-profit path, so the
+    closed form resumes there with (numerically) the same state.
+
+    All prior dependence enters through the input arrays (g_tilde, B0_tilde);
+    no uniform-prior assumption is made.
+
+    Returns a dict with 'active', corrected arrays ('w','T','G','B','E',
+    'gamma','theta'), 'intervals' [(a_L, a_R), ...] and 'diagnostics'.
+    """
+    n = len(alphas)
+    D_rp = dfun(rp)
+    scale = max(1.0, float(np.max(np.abs(w_vals))))
+    if np.min(w_vals) >= -w_tol_rel * scale:
+        return {'active': False, 'w': w_vals, 'T': T_vals, 'G': G_vals,
+                'B': B_vals, 'E': E_vals,
+                'gamma': np.where(T_vals > 1e-15, G_vals / T_vals, 1.0),
+                'theta': None, 'intervals': [], 'diagnostics': []}
+
+    Gamma_req = (1 + K_vals) / (1 + rp)
+    # Own-slice cumulative integral (left-endpoint, house convention):
+    # cumG[i] ~ calG(omega_g(alphas[i])) - calG(omega_g(alphas[0]))
+    cumG = np.zeros(n)
+    cumG[1:] = np.cumsum((1 - beta) * g_tilde[:-1]) * da
+
+    G_new = G_vals.copy(); B_new = B_vals.copy(); E_new = E_vals.copy()
+    intervals = []          # [(i_L, i_R)] index pairs
+    diagnostics = []
+
+    start = 0
+    while True:
+        neg = np.where(w_vals[start:] < -w_tol_rel * scale)[0]
+        if len(neg) == 0:
+            break
+        i_neg = start + int(neg[0])
+
+        # Scan candidate stopping points downward from the first violation for
+        # the left edge of the N-component (first candidate NOT in N).  The
+        # tangency/resumption point is the restricted argmax at or beyond the
+        # first infeasible index, so the interval always covers it.
+        i_L, i_R = None, None
+        for i in range(i_neg, start - 1, -1):
+            m, j = _frozen_tail_violation(i, G_vals, E_vals, B0_tilde,
+                                          cumG, Gamma_req, j_min=i_neg)
+            if m <= 0.0:
+                i_L, i_R = i, j
+                break
+        if i_L is None:
+            # Component extends to the current segment start — stop there.
+            print("  [ironing] WARNING: no consistent stopping point found "
+                  "above the segment start; ironing from the segment start.")
+            i_L = start
+            _, i_R = _frozen_tail_violation(i_L, G_vals, E_vals, B0_tilde,
+                                            cumG, Gamma_req, j_min=i_neg)
+        if i_R >= n - 1:
+            raise RuntimeError(
+                "iron_region1: a no-entry interval reaches alpha_1 "
+                f"(a_L={alphas[i_L]:.4f}).  This variant (entry never resumes "
+                "in Region I) is not implemented.")
+
+        # Overwrite the state on the interior of the component with the
+        # frozen-pool propagation.  Edge points keep closed-form values
+        # (state is continuous at a_L by construction, at a_R by tangency).
+        ks = np.arange(i_L + 1, i_R)
+        E_new[ks] = E_vals[i_L]
+        B_new[ks] = E_vals[i_L] * B0_tilde[ks]
+        G_new[ks] = G_vals[i_L] + (cumG[ks] - cumG[i_L])
+
+        # Diagnostics: does the pointwise-negative set start after a_L?  How
+        # good is the state match at the tangency point a_R?
+        mismatch_G = abs((G_vals[i_L] + (cumG[i_R] - cumG[i_L]) - G_vals[i_R])
+                         / max(abs(G_vals[i_R]), 1e-15))
+        mismatch_B = abs((E_vals[i_L] * B0_tilde[i_R] - B_vals[i_R])
+                         / max(abs(B_vals[i_R]), 1e-15))
+        diagnostics.append({
+            'a_L': float(alphas[i_L]), 'a_R': float(alphas[i_R]),
+            'first_w_neg': float(alphas[i_neg]),
+            'state_mismatch_at_aR': (float(mismatch_G), float(mismatch_B)),
+        })
+        intervals.append((i_L, i_R))
+        start = i_R + 1
+
+    T_new = G_new + B_new
+    gamma_new = np.where(T_new > 1e-15, G_new / T_new, 1.0)
+
+    # Segment-aware theta = -d(ln E)/da: one-sided differences at every
+    # regime boundary so the kink in ln E does not smear into w.
+    ln_E = np.log(np.maximum(E_new, 1e-30))
+    theta_new = np.zeros(n)
+    edges = [0] + [e for (iL, iR) in intervals for e in (iL, iR)] + [n - 1]
+    seg_bounds = list(zip(edges[:-1], edges[1:]))
+    for k_seg, (s, e) in enumerate(seg_bounds):
+        inside_component = any(iL == s and iR == e for (iL, iR) in intervals)
+        if inside_component:
+            theta_new[s + 1:e] = 0.0            # E frozen => theta = 0
+            continue
+        if e - s >= 2:
+            theta_new[s + 1:e] = -(ln_E[s + 2:e + 1] - ln_E[s:e - 1]) / (2 * da)
+        if e > s:
+            theta_new[s] = -(ln_E[s + 1] - ln_E[s]) / da
+            theta_new[e] = -(ln_E[e] - ln_E[e - 1]) / da
+
+    w_new = theta_new * D_rp * T_new
+    for (iL, iR) in intervals:
+        w_new[iL + 1:iR] = 0.0
+
+    return {'active': True, 'w': w_new, 'T': T_new, 'G': G_new, 'B': B_new,
+            'E': E_new, 'gamma': gamma_new, 'theta': theta_new,
+            'intervals': [(float(alphas[iL]), float(alphas[iR]))
+                          for (iL, iR) in intervals],
+            'diagnostics': diagnostics}
+
+
+def plateau_cost_factory(lam=0.15, lo=0.15, hi=0.25, s=0.02,
+                         c2=9.0, c1=0.2, n_grid=20001):
+    """Cost function with a flattened-slope window — activates ironing.
+
+    C'(a) = (2*c2*a + c1) * (1 - (1-lam)*win(a)) with a smooth logistic window
+    on [lo, hi]; C by cumulative (trapezoid) integration of C' on a fine grid.
+    With the stock incumbent parameters (Pi=0.235, beta=0.5, B/G=1) and
+    lam=0.15 the closed-form Region-I density goes negative on an interior
+    interval, so iron_region1 has real work to do, while C stays strictly
+    increasing.  Returns (cfun, cfun_prime) callables (numpy-vectorized).
+    """
+    grid = np.linspace(0.0, 1.0, n_grid)
+    win = (1.0 / (1.0 + np.exp(-(grid - lo) / s))
+           * 1.0 / (1.0 + np.exp((grid - hi) / s)))
+    cp = (2.0 * c2 * grid + c1) * (1.0 - (1.0 - lam) * win)
+    C = np.concatenate([[0.0],
+                        np.cumsum((cp[1:] + cp[:-1]) * 0.5 * np.diff(grid))])
+
+    def cfun_plateau(a):
+        return np.interp(np.asarray(a, dtype=float), grid, C)
+
+    def cfun_prime_plateau(a):
+        return np.interp(np.asarray(a, dtype=float), grid, cp)
+
+    return cfun_plateau, cfun_prime_plateau
+
+
 # =============================================================================
 # NESTED INFORMATION STRUCTURE
 # =============================================================================
@@ -153,12 +369,7 @@ def solve_nested(params):
     # =========================================================================
     # Find alpha0 and rp (entry margin)
     # =========================================================================
-    res = minimize_scalar(
-        lambda a: (Pi + cfun(a) + 1) / gam0(a, params) if 0 < a < 1 else 1e10,
-        bounds=(0.01, 0.99), method='bounded'
-    )
-    alpha0 = res.x
-    rp = (Pi + cfun(alpha0) + 1) / gam0(alpha0, params) - 1
+    alpha0, rp = find_alpha0(params)
     
     # =========================================================================
     # Find alpha1: where c(alpha) = rp - Pi
@@ -337,12 +548,7 @@ def solve_nested_analytical(params):
     # =========================================================================
     # Find alpha0 and rp (same as solve_nested)
     # =========================================================================
-    res = minimize_scalar(
-        lambda a: (Pi + cfun(a) + 1) / gam0(a, params) if 0 < a < 1 else 1e10,
-        bounds=(0.01, 0.99), method='bounded'
-    )
-    alpha0 = res.x
-    rp = (Pi + cfun(alpha0) + 1) / gam0(alpha0, params) - 1
+    alpha0, rp = find_alpha0(params)
 
     # =========================================================================
     # Find alpha1: where K(alpha1) = rp, i.e. C(alpha1) + Pi = rp
@@ -402,7 +608,22 @@ def solve_nested_analytical(params):
 
     # w(alpha) = theta * D(rp) * T
     w_vals = theta_vals * D_rp * T_vals
-    w_vals = np.maximum(w_vals, 0)  # w can't be negative (ironing)
+
+    # Ironing (Appendix "Ironing" of the draft): where the closed-form density
+    # would be negative, the equilibrium instead has no-entry intervals with an
+    # undepleted pool.  iron_region1 detects the intervals (connected
+    # components of the set N) and rebuilds the state arrays consistently; on
+    # calibrations where w >= 0 everywhere it is a no-op passthrough.
+    _ironing = iron_region1(alphas, K_vals, rp, beta, g_tilde, B0_tilde,
+                            T_vals, G_vals, B_vals, E_vals, w_vals, da)
+    if _ironing['active']:
+        w_vals = _ironing['w']
+        T_vals, G_vals, B_vals = _ironing['T'], _ironing['G'], _ironing['B']
+        E_vals, gamma_vals = _ironing['E'], _ironing['gamma']
+        theta_vals = _ironing['theta']
+        print(f"  [ironing] active: no-entry intervals "
+              f"{[(round(a, 4), round(b, 4)) for (a, b) in _ironing['intervals']]}")
+    w_vals = np.maximum(w_vals, 0)  # numerical dust only; negativity handled above
 
     # Cumulative capital: W(alpha_k) = integral of w from alpha0 to alpha_k
     # Use left-endpoint Riemann sum so W(alpha_0) = 0
@@ -502,6 +723,10 @@ def solve_nested_analytical(params):
         'goodleftover_alpha2': goodleftover_alpha2,
         'G_end_R1': G_end_R1,
         'B_end_R1': B_end_R1,
+        # Ironing (Appendix "Ironing"): no-entry intervals in Region I
+        'ironing_active': _ironing['active'],
+        'no_entry_intervals': _ironing['intervals'],
+        'ironing_diagnostics': _ironing['diagnostics'],
     }
 
 
