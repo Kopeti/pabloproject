@@ -1604,7 +1604,12 @@ def _draw_density_panel(ax, omvec, snaps, alphas, beta, kind, thr0, thr1,
     ax.set_xlim(0, 1)
     ax.set_ylim(0, ylim_top)
     ax.set_xlabel(r'$\omega$', fontsize=fs_label)
-    ax.set_ylabel(ylabel, fontsize=fs_label)
+    # Axis name at the panel's top-left corner, to the left of the y-axis (as in
+    # the TikZ panels above), instead of a rotated left label.
+    ax.figure.text(0.01, 0.94, ylabel, ha='left', va='bottom', fontsize=fs_label)
+    # Minimal unit ticks only (no 0.2/0.4/... ladder), matching the TikZ panels.
+    ax.set_xticks([0, 1]); ax.set_xticklabels(['0', '1'])
+    ax.set_yticks([0, 1]); ax.set_yticklabels(['0', '1'])
     ax.tick_params(labelsize=fs_tick)
 
     # threshold lines + labels (staggered top/bottom as in the MATLAB figure)
@@ -1654,25 +1659,40 @@ def plot_density_panels(params, save_dir=None, n_curves=6, figsize=(3.8, 4.0),
     og0, og1 = beta + (1 - beta) * alpha0, beta + (1 - beta) * alpha1
     ob0, ob1 = (1 - beta) + beta * alpha0, (1 - beta) + beta * alpha1
 
-    # --- Bad pool ---
-    figB, axB = plt.subplots(figsize=figsize)
+    # --- Geometry: match the TikZ unit square of fig:density (rows a-d) ---
+    # The TikZ panels draw the 1x1 prior pool as a square 1.0 wide x 0.9 tall
+    # inside a 1.40 x 1.32 bbox, shown at \resizebox{!}{0.25\textheight}, i.e.
+    # 0.1894 x 0.1705 \textheight.  Here we fix the axes box on the figure (no
+    # tight bbox) so the [0,1]x[0,1] data square occupies f_h = AH/YMAX of the
+    # image height and A*AW of its width (A = figure aspect).  With the values
+    # below and the same \includegraphics[height=0.25\textheight] in the draft,
+    # the continuous panels' unit square renders at the same size as the TikZ
+    # ones:  height 0.25*f_h = 0.170\textheight, width 0.25*A*AW = 0.189\textheight.
+    YMAX = 1.1
+    # Mirror the TikZ bbox (1.40 x 1.32, unit square 1.0 x 0.9, left margin 0.10):
+    # using the same margin fractions and aspect, the continuous panels line up
+    # column-wise with the rows above when both sit at height 0.25\textheight.
+    FIGSIZE = (5.3, 5.0)                    # aspect A = 1.06 = 1.40/1.32
+    AXBOX = [0.0714, 0.1667, 0.714, 0.75]  # [L,B,AW,AH] = TikZ margin fractions
+    FS = dict(fs_label=16, fs_tick=14, fs_leg=12, fs_thr=13)
+
+    # --- Bad pool ---  (legend lower-left: the empty corner once omega<omega_b)
+    figB = plt.figure(figsize=FIGSIZE); axB = figB.add_axes(AXBOX)
     _draw_density_panel(
         axB, omvec, snaps['b_snaps'], alphas, beta, kind='bad',
         thr0=ob0, thr1=ob1,
         thr0_lab=r'$\omega_b(\alpha_0)$', thr1_lab=r'$\omega_b(\alpha_1)$',
-        ylabel=r'$b(\omega;r_p,1,\alpha)$', ylim_top=1.5 * BperG,
-        leg_loc='upper left')
-    figB.tight_layout()
+        ylabel=r'$b(\omega;r_p,1,\alpha)$', ylim_top=YMAX,
+        leg_loc='lower left', **FS)
 
     # --- Good pool ---
-    figG, axG = plt.subplots(figsize=figsize)
+    figG = plt.figure(figsize=FIGSIZE); axG = figG.add_axes(AXBOX)
     _draw_density_panel(
         axG, omvec, snaps['g_snaps'], alphas, beta, kind='good',
         thr0=og0, thr1=og1,
         thr0_lab=r'$\omega_g(\alpha_0)$', thr1_lab=r'$\omega_g(\alpha_1)$',
-        ylabel=r'$g(\omega;r_p,1,\alpha)$', ylim_top=1.25,
-        leg_loc='upper left')
-    figG.tight_layout()
+        ylabel=r'$g(\omega;r_p,1,\alpha)$', ylim_top=YMAX,
+        leg_loc='upper left', **FS)
 
     # resolve output directory: draft folder if reachable, else script dir
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -1683,8 +1703,8 @@ def plot_density_panels(params, save_dir=None, n_curves=6, figsize=(3.8, 4.0),
 
     path_b = os.path.join(save_dir, 'densities_bad.pdf')
     path_g = os.path.join(save_dir, 'densities_good.pdf')
-    figB.savefig(path_b, bbox_inches='tight')
-    figG.savefig(path_g, bbox_inches='tight')
+    figB.savefig(path_b)   # fixed-geometry figure: preserve the exact axes box
+    figG.savefig(path_g)
     print(f"Density panels saved to:\n  {path_b}\n  {path_g}")
     print(f"  alpha0={alpha0:.4f}, alpha1={alpha1:.4f}, "
           f"snapshot alphas={np.round(alphas, 3)}")
