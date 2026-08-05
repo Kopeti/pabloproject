@@ -734,103 +734,299 @@ def solve_nested_analytical(params):
 # IID INFORMATION STRUCTURE
 # =============================================================================
 
-def solve_iid(params):
-    """Solve the model under IID information structure using scalar ODE."""
+def solve_iid(params, n_steps=50000, tie_grid_n=2001, max_segments=12):
+    """Solve the model under IID information structure using the scalar ODE,
+    with the equilibrium configurations of the ironing note
+    (Notes/ironing_iid.tex) handled:
+
+      Case 1 (fully separating): the ODE runs to alpha ~ 1 -- identical to the
+          legacy behavior (same Euler updates, same grid, same output arrays).
+      Case 2 (top jump): r(alpha) reaches r_perfect = K(1) at alpha_bar < 1;
+          the schedule truncates there and the atom of perfect screeners at
+          alpha = 1 absorbs the remaining good borrowers.
+      Case 3 (interior ironing): when a second skill ties on the break-even
+          frontier b(alpha, z) = (Pi + 1 + C(alpha))/gamma(alpha, z) - 1, the
+          support jumps: entry stops at m1, resumes at m2 > m1 with the SAME
+          rate and pool (r and z continuous across the gap), and the ODE
+          restarts from (m2, z_tie).  Detected by a per-step global scan of
+          the frontier; gaps are returned in 'gaps'.
+      Corner (complete pooling): if alpha = 0 is the strict argmin of the
+          fresh-pool break-even rate, the unique equilibrium is a single
+          pooling market at r_0(0) serving all borrowers (no schedule).
+
+    The atom's capital W_atom = D(r_perfect) * G_end is reported in every
+    non-pooling case (it was previously ignored).
+
+    Backward compatibility: all legacy keys are returned with unchanged
+    meaning; in Case 1 the arrays are numerically identical to the legacy
+    solver.  New keys: 'gaps' [(a_L, a_R, z_tie, r_tie), ...],
+    'segment_slices' (index slices of the continuous stretches, for plotting),
+    'W_atom', 'case' (1, 2, 3 or 'pooling'), 'pooling'.
+    """
     global _current_params
     _current_params = params
     Pi, beta, BperG = params.Pi, params.beta, params.BperG
-    
+
     z0 = 1 / (1 + BperG)
     G0, B0 = 1.0, BperG
-    
+
     h = lambda a, z: beta * (1 - a) + a * z
     mu = lambda a: beta + a * (1 - beta)
-    
+
     def gamma_f(a, z):
         denom = z * mu(a) + (1 - z) * beta * (1 - a)
         return z * mu(a) / denom if denom > 1e-12 else 0
-    
+
     def r_f(a, z):
         gam = gamma_f(a, z)
         return (Pi + 1 + cfun(a)) / gam - 1 if gam > 1e-12 else 1e10
-    
+
     r_perfect = cfun(1) + Pi
-    
+
     def zprime(a, z):
         Cp, Cpp = cfun_prime(a), cfun_prime2(a)
         if abs(Cp) < 1e-12:
             return 0
         return (Cpp / Cp * h(a, z) + 2 * (z - beta)) * (z - 1) / mu(a)
-    
-    # Find alpha0
+
+    # Break-even frontier b(alpha, z) on a fixed alpha grid (vectorized).
+    A_GRID = np.linspace(0.0, 1.0, tie_grid_n)
+    MU_GRID = beta + A_GRID * (1 - beta)
+    KP1_GRID = Pi + 1 + cfun(A_GRID)
+
+    def b_grid(z):
+        denom = z * MU_GRID + (1 - z) * beta * (1 - A_GRID)
+        gam = np.where(denom > 1e-15, z * MU_GRID / denom, 0.0)
+        return np.where(gam > 1e-12, KP1_GRID / gam - 1.0, 1e10)
+
+    # Find alpha0 (legacy bounded Brent kept verbatim; grid scan only detects
+    # the pooling corner or overrides a missed global minimum, as find_alpha0
+    # does for the nested solver).
     alpha0 = minimize_scalar(
         lambda a: (Pi + 1 + cfun(a)) / gamma_f(a, z0) if gamma_f(a, z0) > 1e-12 else 1e10,
         bounds=(0.01, 0.99), method='bounded'
     ).x
+    b_fresh = b_grid(z0)
+    k_min = int(np.argmin(b_fresh))
+    if k_min == 0 and b_fresh[0] < r_f(alpha0, z0) - 1e-12:
+        # Corner: zero skill is the strict cheapest server of the pristine
+        # pool.  Zero-skill draws are quality-neutral, so the pool never
+        # deteriorates and the unique equilibrium is complete pooling at
+        # r_0(0) (ironing note, Section "The corner").
+        r_pool = r_f(0.0, z0)
+        W_pool = dfun(r_pool) * (G0 + B0)
+        print(f"  [solve_iid] CORNER: alpha=0 is the cheapest skill for the "
+              f"fresh pool. Complete-pooling equilibrium at r={r_pool:.4f}, "
+              f"W={W_pool:.4f} (all borrowers served, no separation, no atom).")
+        one = np.array([0.0])
+        return {
+            'alpha0': 0.0, 'alpha_bar': 0.0,
+            'r0': r_pool, 'r_perfect': r_perfect,
+            'alpha_eq': one, 'z_eq': np.array([z0]),
+            'r_eq': np.array([r_pool]),
+            'G_eq': np.array([0.0]), 'B_eq': np.array([0.0]),
+            'gamma_eq': np.array([z0]), 'w_eq': np.array([0.0]),
+            'W_cumsum': np.array([W_pool]),
+            'z0': z0, 'G0': G0, 'B0': B0, 'da': 0.0,
+            'gaps': [], 'segment_slices': [slice(0, 1)],
+            'W_atom': 0.0, 'case': 'pooling', 'pooling': True,
+        }
+    if b_fresh[k_min] < r_f(alpha0, z0) - 1e-12:
+        res2 = minimize_scalar(
+            lambda a: r_f(a, z0),
+            bounds=(A_GRID[max(k_min - 1, 0)], A_GRID[min(k_min + 1, tie_grid_n - 1)]),
+            method='bounded')
+        if r_f(res2.x, z0) < r_f(alpha0, z0):
+            print(f"  [solve_iid] Brent local minimum at {alpha0:.4f} "
+                  f"overridden by global minimum near {res2.x:.4f}")
+            alpha0 = res2.x
     r0 = r_f(alpha0, z0)
-    
-    # Euler method for ODE
-    n_steps = 50000
-    alpha_path = np.linspace(alpha0, 0.9999, n_steps)
-    da = alpha_path[1] - alpha_path[0]
-    
-    z_path = np.zeros(n_steps)
-    r_path = np.zeros(n_steps)
-    G_path = np.zeros(n_steps)
-    B_path = np.zeros(n_steps)
-    w_over_D = np.zeros(n_steps)
-    
-    z_path[0], r_path[0], G_path[0], B_path[0] = z0, r0, G0, B0
-    alpha_bar_idx = n_steps - 1
-    
-    for k in range(1, n_steps):
-        a, z, G, B = alpha_path[k-1], z_path[k-1], G_path[k-1], B_path[k-1]
-        
-        zp = zprime(a, z)
-        z_path[k] = z + zp * da
-        r_path[k] = r_f(alpha_path[k], z_path[k])
-        
-        if r_path[k] >= r_perfect and alpha_bar_idx == n_steps - 1:
-            alpha_bar_idx = k
-        
-        gam = gamma_f(a, z)
-        wD = zp * (G + B) / (z - gam) if abs(z - gam) > 1e-12 and (G + B) > 1e-12 else 0
-        w_over_D[k-1] = wD
-        
-        G_path[k] = max(G - wD * gam * da, 0)
-        B_path[k] = max(B - wD * (1 - gam) * da, 0)
-    
-    # Truncate to barrier
-    idx = alpha_bar_idx + 1
-    alpha_eq = alpha_path[:idx]
-    z_eq = z_path[:idx]
-    r_eq = r_path[:idx]
-    G_eq = G_path[:idx]
-    B_eq = B_path[:idx]
-    
+
+    # Euler method for ODE, in segments separated by ironing jumps.  Segment 0
+    # uses exactly the legacy grid (linspace alpha0..0.9999, n_steps) and the
+    # legacy step da = alpha_path[1] - alpha_path[0], so in Case 1 -- no ties,
+    # no crossing -- the output is bit-identical to the legacy solver.  Later
+    # segments reuse the same step size da.
+    _grid0 = np.linspace(alpha0, 0.9999, n_steps)
+    da = _grid0[1] - _grid0[0]
+    TIE_MASK_W = 0.03   # ignore the frontier within this window of the
+                        # current skill (the path itself sits at b = r there);
+                        # jumps shorter than this are not detected.
+
+    seg_arrays = []     # list of dicts of truncated per-segment arrays
+    gaps = []           # (a_L, a_R, z_tie, r_tie)
+    a_start, z_start, G_start, B_start = alpha0, z0, G0, B0
+    crossed = False
+    alpha_bar = 0.9999
+    fold_warning = False
+
+    for seg in range(max_segments):
+        n_seg = n_steps if seg == 0 else max(int(np.floor((0.9999 - a_start) / da)) + 1, 2)
+        alpha_path = _grid0 if seg == 0 else a_start + da * np.arange(n_seg)
+
+        z_path = np.zeros(n_seg)
+        r_path = np.zeros(n_seg)
+        G_path = np.zeros(n_seg)
+        B_path = np.zeros(n_seg)
+        w_over_D = np.zeros(n_seg)
+
+        z_path[0], r_path[0] = z_start, r_f(a_start, z_start)
+        G_path[0], B_path[0] = G_start, B_start
+        alpha_bar_idx = n_seg - 1
+        tie_k, tie_j = None, None
+
+        for k in range(1, n_seg):
+            a, z, G, B = alpha_path[k-1], z_path[k-1], G_path[k-1], B_path[k-1]
+
+            zp = zprime(a, z)
+            z_path[k] = z + zp * da
+            r_path[k] = r_f(alpha_path[k], z_path[k])
+
+            if r_path[k] >= r_perfect and alpha_bar_idx == n_seg - 1:
+                alpha_bar_idx = k
+
+            gam = gamma_f(a, z)
+            wD = zp * (G + B) / (z - gam) if abs(z - gam) > 1e-12 and (G + B) > 1e-12 else 0
+            w_over_D[k-1] = wD
+
+            G_path[k] = max(G - wD * gam * da, 0)
+            B_path[k] = max(B - wD * (1 - gam) * da, 0)
+
+            # Ironing tie check: has another skill become strictly cheaper on
+            # the break-even frontier at the current pool?  (Skip the first
+            # few steps of a resumed segment: the landing point is the argmin
+            # there by construction, up to refinement noise.)
+            if alpha_bar_idx == n_seg - 1 and (seg == 0 or k > 10):
+                bvec = b_grid(z_path[k])
+                far = np.abs(A_GRID - alpha_path[k]) >= TIE_MASK_W
+                far &= A_GRID < 0.999   # the corner alpha=1 (b = r_perfect)
+                                        # is the atom, handled by the crossing
+                if np.any(far):
+                    jj = np.where(far)[0][int(np.argmin(bvec[far]))]
+                    if bvec[jj] < r_path[k] - 1e-12:
+                        tie_k, tie_j = k, jj
+                        break
+
+        if tie_k is None:
+            idx = alpha_bar_idx + 1
+            crossed = r_path[alpha_bar_idx] >= r_perfect
+            alpha_bar = alpha_path[alpha_bar_idx]
+        else:
+            # Backfill the w_over_D of the tie point (the legacy loop sets
+            # w_over_D[k-1] during iteration k, and the break at tie_k means
+            # iteration tie_k+1 never ran).  Same state, same formula.
+            idx = tie_k + 1
+            a, z, G, B = (alpha_path[tie_k], z_path[tie_k],
+                          G_path[tie_k], B_path[tie_k])
+            zp = zprime(a, z)
+            gam = gamma_f(a, z)
+            w_over_D[tie_k] = (zp * (G + B) / (z - gam)
+                               if abs(z - gam) > 1e-12 and (G + B) > 1e-12 else 0)
+
+        seg_arrays.append({
+            'alpha': alpha_path[:idx], 'z': z_path[:idx], 'r': r_path[:idx],
+            'G': G_path[:idx], 'B': B_path[:idx], 'wD': w_over_D[:idx],
+        })
+
+        if tie_k is None:
+            break
+
+        # Ironing jump: refine the landing skill m2 = argmin b(., z_tie) near
+        # the grid minimizer, then restart the ODE from (m2, z_tie) with the
+        # pool masses unchanged (no entry inside the gap).
+        z_t, r_t = z_path[tie_k], r_path[tie_k]
+        dg = A_GRID[1] - A_GRID[0]
+        m2 = minimize_scalar(
+            lambda aa: r_f(aa, z_t),
+            bounds=(max(A_GRID[tie_j] - 2 * dg, 0.0),
+                    min(A_GRID[tie_j] + 2 * dg, 1.0)),
+            method='bounded').x
+        gaps.append((float(alpha_path[tie_k]), float(m2), float(z_t), float(r_t)))
+        print(f"  [solve_iid] ironing: skill support jumps "
+              f"{alpha_path[tie_k]:.4f} -> {m2:.4f} at pool z={z_t:.4f} "
+              f"(rate {r_t:.4f} continuous across the gap)")
+        a_start, z_start = m2, z_t
+        G_start, B_start = G_path[tie_k], B_path[tie_k]
+    else:
+        print("  [solve_iid] WARNING: max_segments reached; schedule truncated.")
+
+    # Concatenate segments
+    alpha_eq = np.concatenate([s['alpha'] for s in seg_arrays])
+    z_eq = np.concatenate([s['z'] for s in seg_arrays])
+    r_eq = np.concatenate([s['r'] for s in seg_arrays])
+    G_eq = np.concatenate([s['G'] for s in seg_arrays])
+    B_eq = np.concatenate([s['B'] for s in seg_arrays])
+    wD_eq = np.concatenate([s['wD'] for s in seg_arrays])
+    lens = [len(s['alpha']) for s in seg_arrays]
+    starts = np.concatenate([[0], np.cumsum(lens)[:-1]])
+    segment_slices = [slice(int(s), int(s + l)) for s, l in zip(starts, lens)]
+
     gamma_eq = np.array([gamma_f(alpha_eq[i], z_eq[i]) for i in range(len(alpha_eq))])
-    w_eq = np.array([w_over_D[k] * dfun(r_eq[k]) if r_eq[k] > 1e-12 else 0 for k in range(len(alpha_eq))])
+    w_eq = np.array([wD_eq[k] * dfun(r_eq[k]) if r_eq[k] > 1e-12 else 0
+                     for k in range(len(alpha_eq))])
+    if np.min(w_eq) < -1e-6 * max(1.0, float(np.max(np.abs(w_eq)))):
+        fold_warning = True
+        print("  [solve_iid] WARNING: negative entry density detected on the "
+              "kept path -- an undetected fold/tie (raise tie_grid_n or lower "
+              "TIE_MASK_W).")
     W_iid_cumsum = np.cumsum(w_eq) * da
-    
+
+    # Atom of perfect screeners at alpha = 1: absorbs the remaining good
+    # borrowers at r_perfect = K(1).  (In Case 1 the schedule reaches alpha ~ 1
+    # with a small residual; in Case 2 the residual is large.)
+    G_end, B_end = float(G_eq[-1]), float(B_eq[-1])
+    W_atom = dfun(r_perfect) * G_end if r_perfect > 1e-12 else 0.0
+
+    case = 3 if gaps else (2 if crossed and alpha_bar < 0.98 else 1)
+
     return {
-        'alpha0': alpha0, 'alpha_bar': alpha_path[alpha_bar_idx],
+        'alpha0': alpha0, 'alpha_bar': alpha_bar,
         'r0': r0, 'r_perfect': r_perfect,
         'alpha_eq': alpha_eq, 'z_eq': z_eq, 'r_eq': r_eq,
         'G_eq': G_eq, 'B_eq': B_eq,
         'gamma_eq': gamma_eq, 'w_eq': w_eq,
         'W_cumsum': W_iid_cumsum,
-        'z0': z0, 'G0': G0, 'B0': B0, 'da': da
+        'z0': z0, 'G0': G0, 'B0': B0, 'da': da,
+        # New: ironing / atom / classification
+        'gaps': gaps, 'segment_slices': segment_slices,
+        'W_atom': W_atom, 'case': case, 'pooling': False,
+        'fold_warning': fold_warning,
     }
 
 # =============================================================================
 # PLOTTING
 # =============================================================================
 
+def _iid_segments(iid):
+    """Index slices of the continuous stretches of the iid schedule (one slice
+    for legacy results without the 'segment_slices' key)."""
+    return iid.get('segment_slices') or [slice(0, len(iid['alpha_eq']))]
+
+
+def _plot_iid_curve(ax, iid, yvals, style='r-', lw=2, label=None):
+    """Plot an iid equilibrium object segment by segment so that lines break
+    at ironing gaps instead of bridging them."""
+    for i, s in enumerate(_iid_segments(iid)):
+        ax.plot(iid['alpha_eq'][s], yvals[s], style, lw=lw,
+                label=label if i == 0 else None)
+
+
+def _shade_iid_gaps(ax, iid):
+    """Light shading over skill intervals never chosen in the iid equilibrium
+    (interior ironing gaps and, in the top-jump case, [alpha_bar, 1))."""
+    for (aL, aR, _z, _r) in iid.get('gaps', []):
+        ax.axvspan(aL, aR, color='0.85', alpha=0.6, lw=0, zorder=0)
+    if iid.get('case') == 2:
+        ax.axvspan(iid['alpha_bar'], 1.0, color='0.85', alpha=0.6, lw=0, zorder=0)
+
+
 def plot_comparison(params, nested, iid, nested_disc=None):
     """Create comparison plots for nested (analytical) vs IID equilibria.
 
     If nested_disc (discrete solver result) is provided, its curves are
-    overlaid as dashed green lines for comparison.
+    overlaid as dashed green lines for comparison.  IID curves are drawn
+    segment by segment (broken at ironing gaps, which are shaded), and the
+    atom of perfect screeners at alpha = 1 is marked where present.
     """
     fig, axes = plt.subplots(2, 2, figsize=(12, 10))
 
@@ -857,7 +1053,14 @@ def plot_comparison(params, nested, iid, nested_disc=None):
     axes[0,0].plot(alpha_r1, r_r1, 'b-', lw=2, label='Nested analytical')
     axes[0,0].plot(alpha_r2, r_r2, 'b-', lw=2)
     axes[0,0].plot(0, r_NS, 'bo', markersize=10, markerfacecolor='blue', label='Nested (non-selective)')
-    axes[0,0].plot(iid['alpha_eq'], iid['r_eq'], 'r-', lw=2, label='IID')
+    _plot_iid_curve(axes[0,0], iid, iid['r_eq'], 'r-', lw=2, label='IID')
+    _shade_iid_gaps(axes[0,0], iid)
+    if iid.get('pooling'):
+        axes[0,0].plot(0, iid['r0'], 'r^', markersize=10,
+                       label='IID (complete pooling)')
+    elif iid.get('W_atom', 0) > 0:
+        axes[0,0].plot(1, iid['r_perfect'], 'ro', markersize=7,
+                       label='IID atom at $\\alpha=1$')
 
     if nested_disc is not None:
         a2_d = nested_disc['alpha2']
@@ -893,7 +1096,10 @@ def plot_comparison(params, nested, iid, nested_disc=None):
     # =========================================================================
     axes[0,1].plot(nested['alphas_R1'], nested['gammas_R1'], 'b-', lw=2, label='Nested analytical')
     axes[0,1].plot(nested['alphas_R2'], nested['gammas_R2'], 'b-', lw=2)
-    axes[0,1].plot(iid['alpha_eq'], iid['gamma_eq'], 'r-', lw=2, label='IID')
+    _plot_iid_curve(axes[0,1], iid, iid['gamma_eq'], 'r-', lw=2, label='IID')
+    _shade_iid_gaps(axes[0,1], iid)
+    if not iid.get('pooling') and iid.get('W_atom', 0) > 0:
+        axes[0,1].plot(1, 1.0, 'ro', markersize=7)
 
     if nested_disc is not None:
         axes[0,1].plot(nested_disc['alphas_R1'][:-1], nested_disc['gammas_R1'],
@@ -938,7 +1144,16 @@ def plot_comparison(params, nested, iid, nested_disc=None):
     # IID
     alpha_before_iid = np.linspace(0, iid['alpha0'], 20)
     axes[1,0].plot(alpha_before_iid, np.zeros_like(alpha_before_iid), 'r-', lw=2, label='IID')
-    axes[1,0].plot(iid['alpha_eq'], iid['W_cumsum'], 'r-', lw=2)
+    _plot_iid_curve(axes[1,0], iid, iid['W_cumsum'], 'r-', lw=2)
+    for s in _iid_segments(iid)[1:]:
+        # cumulative capital is flat across an ironing gap
+        prev_end = s.start - 1
+        axes[1,0].plot([iid['alpha_eq'][prev_end], iid['alpha_eq'][s.start]],
+                       [iid['W_cumsum'][prev_end]] * 2, 'r:', lw=1.5)
+    if not iid.get('pooling') and iid.get('W_atom', 0) > 0:
+        W_end_iid = iid['W_cumsum'][-1]
+        axes[1,0].plot([1, 1], [W_end_iid, W_end_iid + iid['W_atom']], 'r-', lw=2)
+        axes[1,0].plot(1, W_end_iid + iid['W_atom'], 'ro', markersize=7)
 
     axes[1,0].axvline(alpha0, color='black', ls=':', alpha=0.3)
     axes[1,0].axvline(alpha1, color='blue', ls=':', alpha=0.5)
@@ -956,8 +1171,8 @@ def plot_comparison(params, nested, iid, nested_disc=None):
     axes[1,1].plot(nested['alphas_R1'], nested['BLOs_R1'], 'b--', lw=2, label='Analytical B')
     axes[1,1].plot(nested['alphas_R2'], nested['GLOs_R2'], 'b-', lw=2)
     axes[1,1].plot(nested['alphas_R2'], nested['BLOs_R2'], 'b--', lw=2)
-    axes[1,1].plot(iid['alpha_eq'], iid['G_eq'], 'r-', lw=2, label='IID G')
-    axes[1,1].plot(iid['alpha_eq'], iid['B_eq'], 'r--', lw=2, label='IID B')
+    _plot_iid_curve(axes[1,1], iid, iid['G_eq'], 'r-', lw=2, label='IID G')
+    _plot_iid_curve(axes[1,1], iid, iid['B_eq'], 'r--', lw=2, label='IID B')
 
     if nested_disc is not None:
         axes[1,1].plot(nested_disc['alphas_R1'][:-1], nested_disc['GLOs_R1'],
@@ -1450,9 +1665,18 @@ def plot_cumulative_lending(params, nested, iid):
         # Region II
         ax.plot(nested['alphas_R2'], cum_n_R2, 'b-', lw=2)
 
-        # IID: zero until alpha0, then cumulative
+        # IID: zero until alpha0, then cumulative (broken at ironing gaps;
+        # flat dotted bridge across each gap, no lending there)
         ax.plot(alpha_pre_iid, np.zeros_like(alpha_pre_iid), 'r-', lw=2, label='IID')
-        ax.plot(iid['alpha_eq'], cum_i, 'r-', lw=2)
+        _plot_iid_curve(ax, iid, cum_i, 'r-', lw=2)
+        for s in _iid_segments(iid)[1:]:
+            prev_end = s.start - 1
+            ax.plot([iid['alpha_eq'][prev_end], iid['alpha_eq'][s.start]],
+                    [cum_i[prev_end]] * 2, 'r:', lw=1.5)
+        if title == 'Good Borrowers' and iid.get('W_atom', 0) > 0:
+            # atom of perfect screeners: all-good lending jump at alpha = 1
+            ax.plot([1, 1], [cum_i[-1], cum_i[-1] + iid['W_atom']], 'r-', lw=2)
+            ax.plot(1, cum_i[-1] + iid['W_atom'], 'ro', markersize=6)
 
         # Boundary markers
         ax.axvline(alpha0, color='blue', ls=':', alpha=0.4, label=f'alpha0={alpha0:.3f}')
@@ -1469,6 +1693,106 @@ def plot_cumulative_lending(params, nested, iid):
     fig.suptitle(f'Cumulative Lending by Borrower Type  ({prior_desc})', fontsize=13)
     plt.tight_layout()
     return fig
+
+
+# =============================================================================
+# IID CASE DEMOS  (the three configurations of Notes/ironing_iid.tex)
+# =============================================================================
+
+def run_iid_case_demos(save_dir=None, show_titles=True):
+    """Solve and plot the three iid equilibrium configurations of the ironing
+    note (Notes/ironing_iid.tex), using its exact parameterizations mapped
+    into this module's convention K(alpha) = Pi + C(alpha):
+
+      Case 1 (fully separating):  K = 0.10 + 0.50 a^2,                q0 = 0.60
+      Case 2 (top jump):          K = 0.10 + 0.48(3a^2-2a^3) + 0.02a, q0 = 0.75
+      Case 3 (interior ironing):  K = 0.05 + 0.55 a + 0.02 sin(4 pi a), q0 = 0.70
+
+    all with beta = 0.5 and uniform priors (q0 pins BperG = (1-q0)/q0).
+    The module cost function is overridden for the duration and restored on
+    exit (cfun_prime / cfun_prime2 are numerical, so they follow along).
+    Saves credit_model_iid_cases.png; returns the list of solve_iid results.
+    """
+    import os
+    global cfun
+    old_cfun = cfun
+    specs = [
+        ("Case 1: fully separating (no gaps)",
+         lambda a: 0.50 * np.asarray(a, dtype=float)**2, 0.10, 0.40 / 0.60),
+        ("Case 2: top jump -- entry stops early, atom at alpha=1",
+         lambda a: 0.48 * (3 * np.asarray(a, dtype=float)**2
+                           - 2 * np.asarray(a, dtype=float)**3)
+                   + 0.02 * np.asarray(a, dtype=float), 0.10, 0.25 / 0.75),
+        ("Case 3: interior ironing -- a gap inside the schedule",
+         lambda a: 0.55 * np.asarray(a, dtype=float)
+                   + 0.02 * np.sin(4 * np.pi * np.asarray(a, dtype=float)), 0.05, 0.30 / 0.70),
+    ]
+    results = []
+    try:
+        for label, cost, Pi_v, bpg in specs:
+            cfun = cost
+            p = Parameters(Pi=Pi_v, beta=0.5, BperG=bpg)
+            print(f"\n--- {label} ---")
+            res = solve_iid(p)
+            print(f"  case={res['case']}  alpha0={res['alpha0']:.4f}  "
+                  f"alpha_bar={res['alpha_bar']:.4f}  "
+                  f"gaps={[(round(a, 3), round(b, 3)) for (a, b, _, _) in res['gaps']]}  "
+                  f"W_atom={res['W_atom']:.4f}")
+            results.append((label, p, res))
+    finally:
+        cfun = old_cfun
+
+    fig, axes = plt.subplots(3, 2, figsize=(11, 12))
+    C_GAM, C_Q = '#3182bd', '#e6550d'
+    for row, (label, p, res) in enumerate(results):
+        axL, axR = axes[row]
+        rK1 = res['r_perfect']
+
+        # left: interest rate schedule
+        axL.axhline(rK1, color='0.5', ls='--', lw=0.8)
+        _plot_iid_curve(axL, res, res['r_eq'], 'r-', lw=2)
+        _shade_iid_gaps(axL, res)
+        if res.get('W_atom', 0) > 0:
+            axL.plot(1, rK1, 'ro', markersize=7)
+            axL.annotate('atom', (1, rK1), xytext=(0.97, rK1 - 0.05),
+                         ha='right', fontsize=9)
+        axL.annotate('$K(1)$', (0.02, rK1), xytext=(0.02, rK1 + 0.005),
+                     fontsize=9, color='0.4')
+        axL.set_ylabel(r'$r(\alpha)$')
+        if show_titles:
+            axL.set_title(label, loc='left', fontsize=10)
+        axL.set_xlim([0, 1.03]); axL.grid(alpha=0.3)
+
+        # right: pool quality z and repayment probability gamma
+        _plot_iid_curve(axR, res, res['gamma_eq'], '-', lw=2)
+        for line in axR.get_lines()[-len(_iid_segments(res)):]:
+            line.set_color(C_GAM)
+        _plot_iid_curve(axR, res, res['z_eq'], '--', lw=2)
+        for line in axR.get_lines()[-len(_iid_segments(res)):]:
+            line.set_color(C_Q)
+        _shade_iid_gaps(axR, res)
+        if res.get('W_atom', 0) > 0:
+            axR.plot(1, 1.0, 'o', color=C_GAM, markersize=7)
+        i0 = max(len(res['alpha_eq']) // 10, 0)
+        axR.annotate(r'$\gamma(\alpha,\alpha)$',
+                     (res['alpha_eq'][i0], res['gamma_eq'][i0] + 0.04),
+                     fontsize=9, color='0.2', ha='center')
+        axR.annotate(r'$q(\alpha)$',
+                     (res['alpha_eq'][i0], res['z_eq'][i0] - 0.06),
+                     fontsize=9, color='0.2', ha='center')
+        axR.set_ylabel(r'$q(\alpha)$, $\gamma(\alpha,\alpha)$')
+        axR.set_xlim([0, 1.03]); axR.set_ylim([0, 1.08]); axR.grid(alpha=0.3)
+        if row == 2:
+            axL.set_xlabel(r'$\alpha$'); axR.set_xlabel(r'$\alpha$')
+
+    fig.suptitle('IID equilibrium: the three configurations '
+                 '(Notes/ironing_iid.tex)', fontsize=12)
+    fig.tight_layout()
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    out = os.path.join(save_dir or script_dir, 'credit_model_iid_cases.png')
+    fig.savefig(out, dpi=150, bbox_inches='tight')
+    print(f"\nIID case-demo plot saved to {out}")
+    return results
 
 
 # =============================================================================
@@ -1749,7 +2073,12 @@ def main():
     print(f"alpha_bar = {iid['alpha_bar']:.4f}")
     print(f"r0 = {iid['r0']:.4f}")
     print(f"r_perfect = {iid['r_perfect']:.4f}")
-    print(f"Total W = {iid['W_cumsum'][-1]:.4f}")
+    print(f"Total W (continuous part) = {iid['W_cumsum'][-1]:.4f}")
+    print(f"case = {iid['case']}"
+          + (f", ironing gaps = "
+             f"{[(round(a, 3), round(b, 3)) for (a, b, _, _) in iid['gaps']]}"
+             if iid['gaps'] else "")
+          + f", atom at alpha=1: W_atom = {iid['W_atom']:.4f}")
 
     # Average interest rate for good borrowers
     avg_r_nested, avg_r_iid, W_good_nested, W_good_iid = compute_avg_good_rate(params, nested_a, iid)
@@ -1774,6 +2103,11 @@ def main():
     output_path2 = os.path.join(script_dir, 'credit_model_lending.png')
     fig2.savefig(output_path2, dpi=150, bbox_inches='tight')
     print(f"Lending plot saved to {output_path2}")
+
+    # IID case demos: the three equilibrium configurations of the ironing note
+    # (fully separating / top jump / interior ironing), each solved and plotted.
+    print("\n--- IID Case Demos (Notes/ironing_iid.tex configurations) ---")
+    run_iid_case_demos()
 
     # Density-evolution panels (e,f) of fig:density in the draft.
     # Uses the figs-8/9 calibration (Pi=0.235, beta=0.5, BperG=1.0,
