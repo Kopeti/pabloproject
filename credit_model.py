@@ -17,9 +17,13 @@ warnings.filterwarnings('ignore')
 # Cost function: c(alpha) = COST_C2 * alpha**COST_P2 + COST_C1 * alpha**COST_P1
 # Change these four parameters — cfun, cfun_prime_exact, cfun_prime2_exact
 # are all derived from them and stay consistent automatically.
-COST_C2 = 0.2
-COST_P2 = 2.0
-COST_C1 = 1.0
+# NOTE on alpha2: the NS margin solves (1-beta)(1-a)C(a) = badleftover*(1+Pi),
+# so the largest attainable alpha2 is capped by the peak of (1-a)C(a): a=1/2
+# for linear C, 2/3 for quadratic, 3/4 for cubic.  The cubic-dominant cost
+# below (was 0.2a^2 + 1.0a) is what lets alpha2 sit at ~0.69 instead of ~0.3.
+COST_C2 = 2.0
+COST_P2 = 3.0
+COST_C1 = 0.1
 COST_P1 = 1.0
 
 def cfun(alpha):
@@ -54,10 +58,20 @@ def dfun(r0):
 
 @dataclass
 class Parameters:
-    """Model parameters."""
-    Pi: float = 0.05      # Profit margin
+    """Model parameters.
+
+    Baseline (Pi=0.15, BperG=0.19, cubic-dominant cost) drops the old
+    requirement that nested and iid produce the same total capital Wbar
+    (which pinned BperG=0.2197 with Pi=0.05 and cost 0.2a^2+a).  It is chosen
+    instead so the comparison figure is legible: avg good-borrower rate gap
+    nested - iid ~ +0.065 (was +0.011), and alpha2 ~ 0.69 interior (was 0.33),
+    so all three nested regions are present and not squeezed to the left.
+    BperG much above 0.19 kills Region III (no NS root); much below shrinks
+    the rate gap.
+    """
+    Pi: float = 0.15      # Profit margin
     beta: float = 0.1     # Signal precision parameter was 0.3
-    BperG: float = 0.2197  # Ratio of bad to good borrowers
+    BperG: float = 0.19   # Ratio of bad to good borrowers
     Delta: float = 0.001  # Step size for alpha iteration
     delom: float = 0.0001 # Step size for omega grid
     # Prior shape parameters (0 = uniform)
@@ -1086,7 +1100,8 @@ def plot_comparison(params, nested, iid, nested_disc=None):
     axes[0,0].set_title('Interest Rate')
     axes[0,0].legend(loc='upper left', fontsize=8)
     axes[0,0].grid(alpha=0.3)
-    axes[0,0].set_xlim([0, 1]); axes[0,0].set_ylim([0, 1.5])
+    r_top = max(1.5, 1.08 * iid.get('r_perfect', 0.0), 1.08 * r_NS)
+    axes[0,0].set_xlim([0, 1]); axes[0,0].set_ylim([0, r_top])
     axes[0,0].text((alpha0+alpha1)/2, rp - 0.06, 'I', fontsize=12, color='blue')
     axes[0,0].text((alpha1+alpha2)/2, 0.45, 'II', fontsize=12, color='blue')
     axes[0,0].text(0.03, r_NS + 0.05, 'III', fontsize=12, color='blue')
@@ -1576,8 +1591,8 @@ def compute_avg_good_rate(params, nested, iid):
 
 def plot_cumulative_lending(params, nested, iid):
     """
-    Plot cumulative total lending quantity to good and bad borrowers as alpha
-    increases from alpha=0 (non-selective lenders in nested) upward.
+    Plot cumulative total lending quantity to good and bad borrowers, in two
+    views: by skill alpha (top row) and by interest rate r (bottom row).
 
     Quantity = D(r) * borrower mass served per unit alpha.  Since w(alpha)*da
     already equals D(r)*mass (the solvers build D(r) into w), we can split
@@ -1585,15 +1600,22 @@ def plot_cumulative_lending(params, nested, iid):
         good contribution at alpha = gamma(alpha) * w(alpha) * da
         bad  contribution at alpha = (1-gamma(alpha)) * w(alpha) * da
 
-    Nested ordering (lowest to highest alpha):
+    Nested ordering by alpha (lowest to highest):
         alpha=0  : non-selective (Region III) lenders — jump of WNS
         0..alpha0: flat (no additional lenders in nested)
         alpha0..alpha1: Region I  (pooling rate rp, mixed pool)
         alpha1..alpha2: Region II (screening, gamma=1, only good borrowers)
 
-    IID ordering:
+    IID ordering by alpha:
         0..alpha0: zero lending
         alpha0..alpha_bar: IID selective lenders
+
+    In the by-r view the nested ordering REVERSES: Region I lends its whole
+    mass at the lowest rate rp (vertical jump), Region II spreads over
+    (rp, r_NS], and the non-selective block lends at the top nested rate
+    r_NS (second jump).  The iid schedule starts at the same bottom rate
+    (r0 = rp, same alpha0 and fresh pool) but spreads smoothly upward; its
+    atom of perfect screeners sits at r_perfect = K(1).
     """
     # -------------------------------------------------------------------------
     # Nested: Region III (non-selective, at alpha=0)
@@ -1637,6 +1659,17 @@ def plot_cumulative_lending(params, nested, iid):
     cum_bad_iid  = np.concatenate([[0.0], np.cumsum(bad_iid[:-1])])
 
     # -------------------------------------------------------------------------
+    # By-r decomposition (nested): Region I all at rp, Region II over
+    # (rp, r_NS], NS block at r_NS.  (Same per-step quantities, reordered.)
+    # -------------------------------------------------------------------------
+    rp   = nested['rp']
+    r_NS = nested['r_NS']
+    G1_tot = np.sum(good_R1[:-1])          # Region I totals (all lent at rp)
+    B1_tot = np.sum(bad_R1[:-1])
+    r_R2 = cfun(alphas_R2) + params.Pi     # Region II rate, rises rp -> r_NS
+    cumr_good_R2 = G1_tot + np.concatenate([[0.0], np.cumsum(good_R2[:-1])])
+
+    # -------------------------------------------------------------------------
     # Plot
     # -------------------------------------------------------------------------
     alpha0 = nested['alpha0']
@@ -1645,12 +1678,12 @@ def plot_cumulative_lending(params, nested, iid):
     alpha_ns_flat  = np.linspace(0.0, alpha0, 30)
     alpha_pre_iid  = np.linspace(0.0, iid['alpha0'], 20)
 
-    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+    fig, axes = plt.subplots(2, 2, figsize=(12, 10))
     prior_desc = ("uniform priors" if params.a_g == 0 and params.a_b == 0
                   else f"a_g={params.a_g}, a_b={params.a_b}")
 
     for ax, (cum_n_R1, cum_n_R2, cum_i, Q_ns, title) in zip(
-        axes,
+        axes[0],
         [
             (cum_good_R1, cum_good_R2, cum_good_iid, Q_NS_good, 'Good Borrowers'),
             (cum_bad_R1,  cum_bad_R2,  cum_bad_iid,  Q_NS_bad,  'Bad Borrowers'),
@@ -1685,10 +1718,62 @@ def plot_cumulative_lending(params, nested, iid):
 
         ax.set_xlabel(r'$\alpha$')
         ax.set_ylabel('Cumulative lending quantity  D(r) x mass')
-        ax.set_title(title)
+        ax.set_title(title + '  (by skill $\\alpha$)')
         ax.legend(fontsize=8)
         ax.grid(alpha=0.3)
         ax.set_xlim([0, 1])
+
+    # -------------------------------------------------------------------------
+    # Bottom row: same cumulatives ordered by interest rate r
+    # -------------------------------------------------------------------------
+    r_perfect = iid.get('r_perfect', 0.0)
+    W_atom = iid.get('W_atom', 0.0)
+    r_max = max(r_NS, float(iid['r_eq'][-1]),
+                r_perfect if W_atom > 0 else 0.0)
+
+    for ax, (jump1, cum_R2_r, flat_R2, cum_i, Q_ns, has_atom, title) in zip(
+        axes[1],
+        [
+            (G1_tot, cumr_good_R2, False, cum_good_iid, Q_NS_good, True,
+             'Good Borrowers'),
+            (B1_tot, None,         True,  cum_bad_iid,  Q_NS_bad,  False,
+             'Bad Borrowers'),
+        ]
+    ):
+        # Nested: nothing below rp, Region I mass as a jump at rp
+        ax.plot([0, rp], [0, 0], 'b-', lw=2)
+        ax.plot([rp, rp], [0, jump1], 'b-', lw=2, label='Nested')
+        if flat_R2:
+            # Region II serves only good borrowers: bad cumulative stays flat
+            ax.plot([rp, r_NS], [jump1, jump1], 'b-', lw=2)
+            nested_top = jump1
+        else:
+            ax.plot(r_R2, cum_R2_r, 'b-', lw=2)
+            nested_top = cum_R2_r[-1]
+        # NS block lends at the top nested rate r_NS
+        ax.plot([r_NS, r_NS], [nested_top, nested_top + Q_ns], 'b-', lw=2)
+        ax.plot(r_NS, nested_top + Q_ns, 'bo', markersize=6)
+
+        # IID: spreads smoothly upward from the same bottom rate r0 = rp
+        for i, s in enumerate(_iid_segments(iid)):
+            ax.plot(iid['r_eq'][s], cum_i[s], 'r-', lw=2,
+                    label='IID' if i == 0 else None)
+        if has_atom and W_atom > 0:
+            ax.plot([r_perfect, r_perfect],
+                    [cum_i[-1], cum_i[-1] + W_atom], 'r-', lw=2)
+            ax.plot(r_perfect, cum_i[-1] + W_atom, 'ro', markersize=6)
+
+        ax.axvline(rp,   color='blue', ls=':',  alpha=0.4,
+                   label=f'$r_p$={rp:.3f}')
+        ax.axvline(r_NS, color='blue', ls='--', alpha=0.4,
+                   label=f'$r_{{NS}}$={r_NS:.3f}')
+
+        ax.set_xlabel(r'$r$')
+        ax.set_ylabel('Cumulative lending quantity  D(r) x mass')
+        ax.set_title(title + '  (by rate $r$)')
+        ax.legend(fontsize=8)
+        ax.grid(alpha=0.3)
+        ax.set_xlim([0, 1.05 * r_max])
 
     fig.suptitle(f'Cumulative Lending by Borrower Type  ({prior_desc})', fontsize=13)
     plt.tight_layout()
