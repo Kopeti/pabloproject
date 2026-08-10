@@ -58,7 +58,8 @@ def plot_paper_figure(params, nested, iid):
     axes[0,0].set_title('(A) Interest Rate')
     axes[0,0].legend(loc='upper left', fontsize=8, bbox_to_anchor=(0, 0.88))
     axes[0,0].grid(alpha=0.3)
-    axes[0,0].set_xlim([-0.03, 1.03]); axes[0,0].set_ylim([0, 1.5])
+    r_top = max(1.5, 1.08 * iid.get('r_perfect', 0.0), 1.08 * r_NS)
+    axes[0,0].set_xlim([-0.03, 1.03]); axes[0,0].set_ylim([0, r_top])
     axes[0,0].text((alpha0+alpha1)/2, rp - 0.06, 'I', fontsize=12, color='blue')
     axes[0,0].text((alpha1+alpha2)/2, 0.45, 'II', fontsize=12, color='blue')
     axes[0,0].text(0.03, r_NS + 0.05, 'III', fontsize=12, color='blue')
@@ -81,7 +82,7 @@ def plot_paper_figure(params, nested, iid):
     axes[0,1].axvline(alpha2, color='blue', ls=':', alpha=0.5)
     axes[0,1].set_xlabel(r'$\alpha$'); axes[0,1].set_ylabel(r'$\gamma(\alpha)$')
     axes[0,1].set_title('(B) Pool Quality (selective lenders)')
-    axes[0,1].legend(fontsize=9)
+    axes[0,1].legend(fontsize=9, loc='center left')
     axes[0,1].grid(alpha=0.3)
     axes[0,1].set_xlim([-0.03, 1.03])
 
