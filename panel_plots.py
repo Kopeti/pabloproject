@@ -107,13 +107,20 @@ def panel_r_alpha(specs, title, filename):
     _save(fig, filename)
 
 
-def panel_r_omega(specs, title, filename, annotations=None):
+def panel_r_omega(specs, title, filename, annotations=None, xlim=None, ylim=None):
     """r(omega) panel — same spec format as panel_r_alpha.
+
+    xlim / ylim (optional) crop the axes for zoom panels; the annotation
+    label strip adapts to the cropped y-range.
 
     annotations (optional) is a dict:
         'vlines':  list of (omega_value, label) tuples — vertical dashed lines.
         'regions': list of (omega_center, label) tuples — region labels along
                     the top of the panel.
+        'callouts': list of (omega_target, label, omega_text) tuples — region
+                    labels placed at omega_text with an arrow pointing at
+                    omega_target.  For regions too narrow to label in place
+                    (e.g. a sliver-thin Region IIb).
     """
     fig, ax = plt.subplots(figsize=(7, 5))
     for spec in specs:
@@ -133,7 +140,9 @@ def panel_r_omega(specs, title, filename, annotations=None):
                     color=color, linestyle=ls, lw=2, label=label)
 
     ax.set_xlabel(r'$\omega$'); ax.set_ylabel(r'$r(\omega)$')
-    ax.set_xlim(0, 1)
+    ax.set_xlim(*(xlim if xlim is not None else (0, 1)))
+    if ylim is not None:
+        ax.set_ylim(*ylim)
     ax.set_title(title)
     ax.grid(alpha=0.3); ax.legend(fontsize=9, loc='best')
 
@@ -157,16 +166,27 @@ def panel_r_omega(specs, title, filename, annotations=None):
         named_ticks.sort(key=lambda t: t[0])
         ax.set_xticks([t for t, _ in named_ticks])
         ax.set_xticklabels([l for _, l in named_ticks])
+        if xlim is not None:
+            # set_xticks with ticks outside the view resets the limits
+            # (observed on matplotlib 3.11); re-apply the zoom crop.
+            ax.set_xlim(*xlim)
         for omega_center, label in annotations.get('regions', []):
             ax.text(omega_center, label_y, label,
                     ha='center', va='center', fontsize=11, color='dimgray',
                     fontweight='bold')
+        for omega_target, label, omega_text in annotations.get('callouts', []):
+            ax.annotate(label,
+                        xy=(omega_target, label_y - 0.055 * yrange),
+                        xytext=(omega_text, label_y),
+                        ha='center', va='center', fontsize=11, color='dimgray',
+                        fontweight='bold',
+                        arrowprops=dict(arrowstyle='->', color='dimgray', lw=1.0))
 
     _save(fig, filename)
 
 
-def panel_K_alpha(specs, title, filename):
-    """K(alpha) panel — same spec format."""
+def panel_K_alpha(specs, title, filename, xlim=None, ylim=None):
+    """K(alpha) panel — same spec format.  xlim/ylim crop for zoom panels."""
     fig, ax = plt.subplots(figsize=(7, 5))
     for spec in specs:
         res = spec['res']
@@ -185,7 +205,9 @@ def panel_K_alpha(specs, title, filename):
                     color=color, linestyle=ls, lw=2, label=label)
 
     ax.set_xlabel(r'$\alpha$'); ax.set_ylabel(r'$K(\alpha)$')
-    ax.set_xlim(0, 1)
+    ax.set_xlim(*(xlim if xlim is not None else (0, 1)))
+    if ylim is not None:
+        ax.set_ylim(*ylim)
     ax.set_title(title)
     ax.grid(alpha=0.3); ax.legend(fontsize=9, loc='best')
     _save(fig, filename)

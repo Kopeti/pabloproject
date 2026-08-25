@@ -49,6 +49,19 @@ _DEFAULT_INC_BASELINE = dict(
     cfun=lambda alpha: 9.0 * alpha**2 + 0.2 * alpha,
 )
 
+
+def _cubic_baseline_cost(alpha):
+    """C(alpha) = 0.2 alpha + 16 alpha^3 -- the flat-then-steep baseline.
+
+    Shared by figure 8 and (defined locally in their drivers) figures 10 and 11.
+    Its flat early section puts the incumbent alpha_0 at 0.140, leaving room for
+    entry below it, while the cubic convexity keeps Region III alive:
+    alpha_1 = 0.394, alpha_2 = 0.612, r_p = 1.293, r_NS = 4.018.
+    Array in / array out: the 'polynomial' cfunE kind evaluates it on an array.
+    """
+    a = np.asarray(alpha, dtype=float)
+    return 0.2 * a + 16.0 * a**3
+
 PARAM_CONFIGS = {
     'FIG7_incumbent': {
         'description': 'Figure 7 / fig:SPT - incumbent only (green dashed curve).',
@@ -75,23 +88,38 @@ PARAM_CONFIGS = {
     },
     'FIG8_bigdata': {
         'description': 'Figure 8 / fig:AIintermediateInnovation - big data: C^E<C for alpha>alpha_hat.',
-        # Aligned with fig9a/fig9b: Pi=0.235 so all three figures share the same
-        # incumbent equilibrium (alpha0=0.056, alpha1=0.351, alpha2=0.633).
-        # PiE=0.5 keeps entrants more expensive at low/mid alpha; the
-        # multiplicative reduction w(alpha) drops C^E below C for alpha > alpha_hat.
-        # At this calibration: alpha2E ≈ 0.79 > alpha2 (Region II extended to the
-        # right, no Region IIb), r_NS drop ≈ 0.43 (positive spillover to NS).
-        # alpha_hat = 0.55 puts the transition inside Region II.
+        # Baseline shared with figures 10 and 11 (C = 0.2a + 16a^3), so the
+        # incumbent equilibrium is alpha0=0.140, alpha1=0.394, alpha2=0.612,
+        # rp=1.293, rNS=4.018.  (It is NO LONGER the 9a^2+0.2a baseline of
+        # fig9a/fig9b -- Appendix D's "common incumbent baseline" now covers
+        # figures 9a/9b only.)
+        #
+        # The entrant's cost is the plain scaled curve C^E = LAM*C with
+        # LAM = 0.5 -- no sigmoid window.  Then
+        #     K^E - K = (PiE - Pi) - (1-LAM) C(alpha)
+        # is smooth and strictly decreasing, so it crosses zero exactly once,
+        # and the saving (1-LAM)C(alpha) grows with alpha on its own: the
+        # big-data story without an engineered transition.  Here the single
+        # crossing IS alpha_hat of the main text (K^E < K above it), whereas in
+        # the old sigmoid form the transition centre (0.55) and the crossing
+        # (0.47) were different points.
+        #
+        # PiE = 1.182 = Pi + (1-LAM)*C(0.4826) places the crossing at
+        # alpha_hat = 0.482, i.e. 41% into Region II -- the same relative
+        # position the old calibration had.
+        # Outcome: alpha2E = 0.685 > alpha2 (Region II extended to the right,
+        # no Region IIb), r_NS 4.018 -> 3.826, drop 0.19.  Same solver branch
+        # as before ("CIM extended, without NS entry"); the drop is about half
+        # the old 0.43 because the cubic baseline is far steeper at high alpha,
+        # so a given proportional saving buys a shorter extension.
         'Pi': 0.235,
         'beta': 0.5,
         'BperG': 1.0,
-        'cfun': lambda alpha: 9.0 * alpha**2 + 0.2 * alpha,
+        'cfun': _cubic_baseline_cost,
         'has_entry': True,
-        'PiE': 0.5,
-        'cfunE_kind': 'cost_reduction_top',
-        'cfunE_params': {'alpha_hat': 0.55, 'lambda': 0.5, 'transition_width': 0.08},
-        # transition_width = 0.08 keeps K^E monotone given C(α)=9α²+0.2α.
-        # The bound is s ≥ (1-λ)·C(α_hat)/[(2+2λ)·C'(α_hat)] ≈ 0.047.
+        'PiE': 1.182,
+        'cfunE_kind': 'polynomial',
+        'cfunE_params': {'coeffs': lambda alpha: 0.5 * _cubic_baseline_cost(alpha)},
     },
     'FIG9_OB_limited': {
         'description': 'Figure 9a / fig:OB left - Open Banking, limited adoption (cost advantage at low alpha).',
