@@ -2574,7 +2574,17 @@ def _build_rate_curve_piecewise(rate_fn, alpha0, alpha1, alpha2,
     rate_fn(alpha_array, alpha0, alpha1, alpha2) — vectorized rate function
     matching the rfun / rfunE signature.
     """
-    eps = 1e-4   # large enough to create a visible gap (~1% of α-range)
+    # Nudge just far enough off each breakpoint to land inside the segment
+    # (rfun/rfunE branch on `<=`, so the boundary itself belongs to the
+    # PREVIOUS region), and no further: each segment is then drawn all the way
+    # to its own limit.  A genuine discontinuity still renders as a break --
+    # the NaN sentinel keeps matplotlib from connecting the two ends, which
+    # now sit at the same α and different rates -- while a continuous join
+    # closes up.  This was 1e-4, chosen to make the breaks visibly wide; at
+    # full scale that is invisible, but on the Region-IIb zoom of figure 10a,
+    # where r climbs at ~17 per unit α, it truncated the curve 0.0018 short of
+    # r_NS and read as a jump that is not there.
+    eps = 1e-9
     # Collect all breakpoints, dedupe, sort, drop those outside [alpha0, 1].
     raw = [alpha0, alpha1, alpha2, 1.0] + [b for b in extra_breakpoints]
     raw = [b for b in raw if alpha0 - 1e-9 <= b <= 1.0 + 1e-9]
@@ -2590,7 +2600,11 @@ def _build_rate_curve_piecewise(rate_fn, alpha0, alpha1, alpha2,
         hi = bps[i + 1] - eps if i + 1 < len(bps) - 1 else bps[i + 1]
         if hi <= lo:
             continue
-        n_pts = max(2, int(n * (hi - lo)))
+        # Floor of 50 so a short segment is not reduced to a straight chord:
+        # the Region-IIb band of figure 10a is 0.0009 wide, which the
+        # width-proportional count alone would sample with 2 points -- fine at
+        # full scale, but that band is the whole subject of its zoom panel.
+        n_pts = max(50, int(n * (hi - lo)))
         a = np.linspace(lo, hi, n_pts)
         r = rate_fn(a, alpha0, alpha1, alpha2)
         segs_a.append(a)
@@ -2605,7 +2619,7 @@ def _build_rate_curve_piecewise(rate_fn, alpha0, alpha1, alpha2,
 
 def _build_omega_curve_from_alpha(r_alphas, r_rates, beta,
                                    alpha0_eff, r_pooling, alpha2_eff, r_NS,
-                                   n_extra=80, eps=1e-4):
+                                   n_extra=80, eps=1e-9):
     """Map an α-axis rate curve to ω-axis via ω = ω_g(α) = β + α(1−β).
 
     Inputs:
@@ -2645,6 +2659,106 @@ def _build_omega_curve_from_alpha(r_alphas, r_rates, beta,
     return omegas, rates
 
 
+def _market_density(alphas, rates, beta):
+    """Capital density in market α when it clears at rate r(α):
+
+        w(α) = D(r(α)) · (1−β) · g̃(ω_g(α)),      ω_g(α) = β + α(1−β)
+
+    i.e. the loan size at the market rate times the mass of good borrowers
+    whose opacity is exactly at the α-lender's acceptance frontier.  This is
+    the same expression wcim / wcimE / fifunE use to clear a CIM market, so
+    the curve is consistent with the rate curve by construction.  NaN
+    sentinels in `alphas`/`rates` are carried through unchanged.
+    """
+    a = np.asarray(alphas, dtype=float)
+    r = np.asarray(rates, dtype=float)
+    out = np.full(a.shape, np.nan)
+    ok = np.isfinite(a) & np.isfinite(r) & (r > 0)
+    if np.any(ok):
+        g_tilde = np.array([gpriorfun_scalar(beta + x * (1 - beta)) for x in a[ok]])
+        D_r = np.array([_scalar(dfun(x)) for x in r[ok]])
+        out[ok] = D_r * (1 - beta) * g_tilde
+    return out
+
+
+def _pooling_density_trim(alphas, w, pooling_rate, K_pool, margin=0.02):
+    """Drop the top of a pooling-region density where the closed form blows up.
+
+    As α approaches the top of the pooling region, T → 0 and θ → ∞: the
+    product is a 0×∞ indeterminate form and the last grid points carry a
+    meaningless spike (incumbent) or collapse to zero (entrant, which
+    solve_entry_pooling_analytical already zeroes with its own `r − K < 0.005`
+    test).  Applying the same test on both sides keeps the two curves
+    comparable instead of contrasting two different artifacts.  The default
+    margin is wider than the solver's 0.005 because the blowup announces
+    itself as an upward hook a few grid points before it bites: on the shipped
+    calibrations 0.02 removes the hook and costs ~0.002 of α at the top.
+    """
+    keep = (np.asarray(pooling_rate, dtype=float) -
+            np.asarray(K_pool, dtype=float)) >= margin
+    if not np.any(keep):          # degenerate calibration: keep everything
+        return np.asarray(alphas, dtype=float), np.asarray(w, dtype=float)
+    return np.asarray(alphas, dtype=float)[keep], np.asarray(w, dtype=float)[keep]
+
+
+def _build_density_curve(pool_alphas, pool_w, r_alphas, r_rates,
+                         alpha_pool_top, alpha_top):
+    """Capital density w(α) over the whole selective range.
+
+    Two pieces, joined by a NaN sentinel because w jumps at the top of the
+    pooling region exactly as r does:
+      • pooling region: the density from the analytical T-construction
+        (`pool_alphas`, `pool_w`) — there is no market-clearing formula there,
+        every α in the region lends at the single pooling rate;
+      • above it: the market-clearing density `_market_density`, read off the
+        rate curve `r_alphas`/`r_rates` that _build_rate_curve_piecewise
+        already built (so every rate discontinuity keeps its gap).
+
+    Only the part of the rate curve in (alpha_pool_top, alpha_top] is used;
+    the flat non-selective tail above alpha_top is an atom at α = 0, not a
+    density, and is returned separately by _ns_capital.
+    """
+    a = np.asarray(r_alphas, dtype=float)
+    keep = ~np.isfinite(a) | ((a > alpha_pool_top + 1e-9) & (a <= alpha_top + 1e-9))
+    a_cim = a[keep]
+    w_cim = _market_density(a_cim, np.asarray(r_rates, dtype=float)[keep], g.beta)
+    nan = np.array([np.nan])
+    return (np.concatenate([np.asarray(pool_alphas, dtype=float), nan, a_cim]),
+            np.concatenate([np.asarray(pool_w, dtype=float), nan, w_cim]))
+
+
+def _ns_capital(rate, alpha_top, badleftover):
+    """Capital held by the non-selective lenders (all of whom sit at α = 0).
+
+        W^NS = D(r_NS) · [ badleftover + ∫_{ω_g(α_top)}^{1} g ]
+
+    With (rate, alpha_top, badleftover) = (r_NS, α₂, badleftover) this
+    reproduces g.WNS from run_baseline; the post-entry atom is the same
+    expression in the post-entry objects (r_NS^E, max(α₂,α₂^E), badleftover^E).
+    """
+    om_top = g.beta + alpha_top * (1 - g.beta)
+    return _scalar(dfun(rate)) * (badleftover +
+                                  quad(gpriorfun_scalar, om_top, 1)[0])
+
+
+def _ns_capital_entry(alpha_top):
+    """Post-entry counterpart of _ns_capital.
+
+    The formula above assumes every non-selective lender is in the top market.
+    That holds after entry only when no Region-IIb band opens.  When one does
+    (α₂^E < α₂), Step 8 spreads the non-selective capital over the band
+    [α₂^E, α₂] and the top market in the proportions the allocation φ fixes,
+    and only the share φ(α₂) lands on top -- so the plain formula overstates
+    the atom (by 2.6% on the parallel-shift calibration, where φ(α₂)=0.897).
+    The total in that case is exactly what _band_capital integrates, which is
+    also the quantity the solver clears against w^NS when it pins α₂^E, so
+    take it from there rather than re-deriving it.
+    """
+    if g.alpha2E < g.alpha2 - 1e-9:
+        return _scalar(_band_capital(g.alpha2E, n_pts=1000))
+    return _ns_capital(g.rnsE, alpha_top, g.badleftoverE)
+
+
 def solve_for_config(name):
     """Run incumbent (and entry, if configured) solve for a named config.
 
@@ -2656,10 +2770,14 @@ def solve_for_config(name):
       'w_inc_fine'   : incumbent entry density on the fine grid
       'gamma_inc'    : γ(α, 1, rp) on the fine grid
       'K_inc_fine'   : K(α) = Π + C(α) on the fine grid
+      'w_inc_alphas', 'w_inc_plot' : capital density w(α) on [α₀, α₂]
+      'WNS_inc'      : capital atom at α = 0 (non-selective lenders)
       'has_entry'    : bool — whether the entry block was solved
       Entry-only (present when has_entry is True):
         'alpha0E', 'alpha1E', 'alpha2E', 'rpE', 'rnsE'
         'K_E_fine' : K^E(α) = Π^E + C^E(α) on the fine grid
+        'w_E_alphas', 'w_E_plot' : post-entry capital density w(α)
+        'WNS_E'    : post-entry capital atom at α = 0
         'wE'       : entry mass profile (from discrete solve)
         'almassE'  : α-grid for the discrete entry solve
     """
@@ -2682,6 +2800,14 @@ def solve_for_config(name):
         r_inc_alphas, r_inc_plot, g.beta, g.alpha0, g.rp, g.alpha2, r_NS_inc)
     K_inc_fine = np.array([_scalar(cfun(a)) for a in g.baseline_alphas_fine]) + g.Pi
     K_inc_plot = np.array([_scalar(cfun(a)) for a in alphas_plot]) + g.Pi
+    # Capital density w(α) on the selective range, plus the α = 0 atom held by
+    # the non-selective lenders.
+    K_pool_inc = np.array([_scalar(cfun(a)) for a in g.baseline_alphas_fine]) + g.Pi
+    w_inc_alphas, w_inc_plot = _build_density_curve(
+        *_pooling_density_trim(g.baseline_alphas_fine, g.baseline_w_fine,
+                               g.rp, K_pool_inc),
+        r_inc_alphas, r_inc_plot, g.alpha1, g.alpha2)
+    WNS_inc = _ns_capital(r_NS_inc, g.alpha2, g.badleftover)
 
     result = {
         'config': cfg,
@@ -2701,6 +2827,9 @@ def solve_for_config(name):
         'r_inc_omegas': r_inc_omegas,
         'r_inc_omega_rates': r_inc_omega_rates,
         'K_inc_plot': K_inc_plot,
+        'w_inc_alphas': w_inc_alphas,
+        'w_inc_plot': w_inc_plot,
+        'WNS_inc': WNS_inc,
         'has_entry': cfg.get('has_entry', True),
     }
 
@@ -2723,6 +2852,24 @@ def solve_for_config(name):
             r_E_alphas, r_E_plot, g.beta,
             max(g.alpha0E, g.alpha0), g.rpE,
             alpha2_eff, g.rnsE)
+        # Post-entry capital density.  In the pooling region the total is the
+        # zero-profit density where entry is active and the (sunk) incumbent
+        # floor where it is suspended — i.e. max(w_total, w_incumbent), which
+        # is w_incumbent + w^E; above it the market-clearing density read off
+        # the post-entry rate curve.  Entry can start below the incumbent α₀,
+        # so the pooling piece runs from α₀^E, not from α₀.
+        ea = g.entry_analytical
+        if ea is not None:
+            w_pool_alphas, w_pool = _pooling_density_trim(
+                ea['alphas'], np.maximum(ea['w_total'], ea['w_incumbent']),
+                g.rpE, ea['KE'])
+        else:
+            w_pool_alphas, w_pool = _pooling_density_trim(
+                g.baseline_alphas_fine, g.baseline_w_fine, g.rp, K_pool_inc)
+        w_E_alphas, w_E_plot = _build_density_curve(
+            w_pool_alphas, w_pool, r_E_alphas, r_E_plot,
+            g.alpha1E, alpha2_eff)
+        WNS_E = _ns_capital_entry(alpha2_eff)
         result.update({
             'alpha0E': g.alpha0E,
             'alpha1E': g.alpha1E,
@@ -2735,6 +2882,9 @@ def solve_for_config(name):
             'r_E_plot': r_E_plot,
             'r_E_omegas': r_E_omegas,
             'r_E_omega_rates': r_E_omega_rates,
+            'w_E_alphas': w_E_alphas,
+            'w_E_plot': w_E_plot,
+            'WNS_E': WNS_E,
             'almassE': almassE,
             'wE': wmassE,
             'gammaE': gammaE,

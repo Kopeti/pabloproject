@@ -23,9 +23,11 @@ cost advantage sits on the skill axis.
                since K^E(0)=K(0); gamma_0 gradient penalizes low-alpha entry;
                Region-I absorption is anchored at alpha_1).
 
-Produces eight PNGs in the paper figures folder (same place as fig9a/fig9b):
-    fig_r_alpha_fig10a.png   fig_r_omega_fig10a.png   fig_K_alpha_fig10a.png
-    fig_r_alpha_fig10b.png   fig_r_omega_fig10b.png   fig_K_alpha_fig10b.png
+Produces, in the paper figures folder (same place as fig9a/fig9b):
+    fig_panels_fig10a.png   the four panels of 10a as a 2x2 grid
+    fig_panels_fig10b.png   the same for 10b
+    fig_{r_alpha,r_omega,K_alpha,w_alpha}_fig10{a,b}.png  the same panels as
+                                    singles, which the main text still uses
     fig_K_alpha_zoom_fig10a.png     zoom of K(alpha) on the band where
                                     K^E < K (the entrant advantage at the
                                     bottom of the skill range)
@@ -35,8 +37,8 @@ Produces eight PNGs in the paper figures folder (same place as fig9a/fig9b):
 """
 import numpy as np
 import mainE_python as m
-from panel_plots import (panel_r_alpha, panel_r_omega, panel_K_alpha,
-                         omega_g, find_omega_H)
+from panel_plots import (panel_grid, panel_r_alpha, panel_r_omega,
+                         panel_K_alpha, panel_w_alpha, omega_g, find_omega_H)
 
 
 # Registered here rather than in mainE_python.PARAM_CONFIGS so the example
@@ -71,8 +73,8 @@ m.PARAM_CONFIGS['FIG10b_pool_worsen'] = {
 }
 
 
-def build_figure(config_name, tag, title_prefix):
-    """Solve one config and emit the three standard panels (as in fig9a/9b)."""
+def build_figure(config_name, tag):
+    """Solve one config and emit its 2x2 panel grid."""
     res = m.solve_for_config(config_name)
 
     beta = res['config']['beta']
@@ -124,10 +126,14 @@ def build_figure(config_name, tag, title_prefix):
          'label': 'post-entry'},
     ]
 
-    panel_r_alpha(specs, f'{title_prefix} — r(alpha)', f'fig_r_alpha_{tag}.png')
-    panel_r_omega(specs, f'{title_prefix} — r(omega)', f'fig_r_omega_{tag}.png',
+    panel_grid(specs, f'fig_panels_{tag}.png', annotations=omega_annotations)
+    # The single-panel PNGs too: the main text still sets some of these as
+    # standalone figures (fig:OB), and build_fig10a_zooms crops two of them.
+    panel_r_alpha(specs, None, f'fig_r_alpha_{tag}.png')
+    panel_r_omega(specs, None, f'fig_r_omega_{tag}.png',
                   annotations=omega_annotations)
-    panel_K_alpha(specs, f'{title_prefix} — K(alpha)', f'fig_K_alpha_{tag}.png')
+    panel_K_alpha(specs, None, f'fig_K_alpha_{tag}.png')
+    panel_w_alpha(specs, None, f'fig_w_alpha_{tag}.png')
     return res
 
 
@@ -151,8 +157,7 @@ def build_fig10a_zooms(res, specs):
     y_hi = max(res['K_inc_plot'][in_win].max(),
                res['K_E_plot'][in_win].max()) + 0.02
     y_lo = res['K_inc_plot'][0] - 0.03
-    panel_K_alpha(specs, r'Figure 10a — K(alpha), zoom: $K^E<K$ band',
-                  'fig_K_alpha_zoom_fig10a.png',
+    panel_K_alpha(specs, None, 'fig_K_alpha_zoom_fig10a.png',
                   xlim=(0.0, a_hi), ylim=(y_lo, y_hi))
 
     # --- zoom 2: Region IIb and the NS-rate drop ------------------------
@@ -170,8 +175,7 @@ def build_fig10a_zooms(res, specs):
                     (x_hi - 1.5 * band, 'III')],
         'callouts': [((omega_2E + omega_2) / 2, 'IIb', omega_2 + 4.0 * band)],
     }
-    panel_r_omega(specs, 'Figure 10a — r(omega), zoom: Region IIb and NS rates',
-                  'fig_r_omega_IIbzoom_fig10a.png',
+    panel_r_omega(specs, None, 'fig_r_omega_IIbzoom_fig10a.png',
                   annotations=zoom_annotations,
                   xlim=(x_lo, x_hi), ylim=(y_lo, y_hi))
 
@@ -180,7 +184,7 @@ def main():
     print("=" * 60)
     print("Building Figure 10a (pool improvement, PiE = Pi)")
     print("=" * 60)
-    res_a = build_figure('FIG10a_pool_improve', 'fig10a', 'Figure 10a')
+    res_a = build_figure('FIG10a_pool_improve', 'fig10a')
     specs_a = [
         {'res': res_a, 'kind': 'incumbent', 'color': 'g', 'linestyle': '--',
          'label': 'incumbent'},
@@ -192,7 +196,7 @@ def main():
     print("=" * 60)
     print("Building Figure 10b (pool worsening, PiE = Pi)")
     print("=" * 60)
-    build_figure('FIG10b_pool_worsen', 'fig10b', 'Figure 10b')
+    build_figure('FIG10b_pool_worsen', 'fig10b')
 
 
 if __name__ == '__main__':

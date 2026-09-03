@@ -27,15 +27,14 @@ the same mechanism.  Note the effect is not monotone in Delta: past
 Delta ~ 0.10 it partly reverses (at Delta = 0.15 the drop falls back to 0.28
 and Region IIb shrinks to 0.015), and Delta = 0.10 is near the widest IIb.
 
-Produces three PNGs in the paper figures folder (same place as fig9a/fig10a):
-    fig_r_alpha_fig11.png    r(alpha) for incumbent + post-entry.
-    fig_r_omega_fig11.png    r(omega) for incumbent + post-entry.
-    fig_K_alpha_fig11.png    K(alpha) and K^E(alpha).
+Produces fig_panels_fig11.png in the paper figures folder -- the four panels
+as a 2x2 grid (cost function, density of lenders, r(omega), r(alpha)) -- plus
+the same four as single-panel PNGs, which the main text still uses.
 """
 import numpy as np
 import mainE_python as m
-from panel_plots import (panel_r_alpha, panel_r_omega, panel_K_alpha,
-                         omega_g, find_omega_H)
+from panel_plots import (panel_grid, panel_r_alpha, panel_r_omega,
+                         panel_K_alpha, panel_w_alpha, omega_g, find_omega_H)
 
 
 PI = 0.235
@@ -115,10 +114,14 @@ def main():
          'label': 'post-entry'},
     ]
 
-    panel_r_alpha(specs, 'Figure 11 — r(alpha)', 'fig_r_alpha_fig11.png')
-    panel_r_omega(specs, 'Figure 11 — r(omega)', 'fig_r_omega_fig11.png',
+    panel_grid(specs, 'fig_panels_fig11.png', annotations=omega_annotations)
+    # The single-panel PNGs too: the main text still sets r(omega) and
+    # K(alpha) as standalone figures (fig:parallel-shift).
+    panel_r_alpha(specs, None, 'fig_r_alpha_fig11.png')
+    panel_r_omega(specs, None, 'fig_r_omega_fig11.png',
                   annotations=omega_annotations)
-    panel_K_alpha(specs, 'Figure 11 — K(alpha)', 'fig_K_alpha_fig11.png')
+    panel_K_alpha(specs, None, 'fig_K_alpha_fig11.png')
+    panel_w_alpha(specs, None, 'fig_w_alpha_fig11.png')
 
     print(f"  alpha0E={res['alpha0E']:.4f}  alpha2E={res['alpha2E']:.4f}  "
           f"IIb={res['alpha2']-res['alpha2E']:.4f}  rpE={res['rpE']:.4f}  "
