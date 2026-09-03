@@ -2734,7 +2734,12 @@ def _build_rate_curve_piecewise(rate_fn, alpha0, alpha1, alpha2,
     # full scale that is invisible, but on the Region-IIb zoom of figure 10a,
     # where r climbs at ~17 per unit α, it truncated the curve 0.0018 short of
     # r_NS and read as a jump that is not there.
-    eps = 1e-9
+    # Must stay comfortably ABOVE the round(b, 8) applied to the breakpoints
+    # below: at 1e-9 the nudge is finer than that rounding, so `bps - eps` can
+    # land on the far side of the true threshold and the segment picks up the
+    # NEXT region's rate -- which silently erased the alpha_1 jump entirely.
+    # At 1e-7 the value error is slope * 1e-7, negligible on any panel.
+    eps = 1e-7
     # Collect all breakpoints, dedupe, sort, drop those outside [alpha0, 1].
     raw = [alpha0, alpha1, alpha2, 1.0] + [b for b in extra_breakpoints]
     raw = [b for b in raw if alpha0 - 1e-9 <= b <= 1.0 + 1e-9]
@@ -2759,6 +2764,26 @@ def _build_rate_curve_piecewise(rate_fn, alpha0, alpha1, alpha2,
         r = rate_fn(a, alpha0, alpha1, alpha2)
         segs_a.append(a)
         segs_r.append(r)
+    # Sampling runs right up to each breakpoint so a CONTINUOUS join closes up
+    # exactly -- a gap there reads as a jump the model does not have (that was
+    # the false discontinuity on figure 10a's Region-IIb zoom).  But then at a
+    # GENUINE jump the two segment ends sit at the same alpha and the break is
+    # invisible.  So nudge only those two x-coordinates apart, keeping their y
+    # at the true one-sided limits: the gap is visible and no rate is misread.
+    finite = np.concatenate([r[np.isfinite(r)] for r in segs_r if np.any(np.isfinite(r))]) \
+        if any(np.any(np.isfinite(r)) for r in segs_r) else np.array([0.0, 1.0])
+    span = max(float(np.max(finite) - np.min(finite)), 1e-12)
+    jump_tol = 1e-3 * span
+    gap = 0.005                      # in alpha units, ~0.5% of the axis
+    for i in range(len(segs_r) - 1):
+        lo_v, hi_v = segs_r[i][-1], segs_r[i + 1][0]
+        if (np.isfinite(lo_v) and np.isfinite(hi_v)
+                and abs(hi_v - lo_v) > jump_tol):
+            segs_a[i] = segs_a[i].copy()
+            segs_a[i + 1] = segs_a[i + 1].copy()
+            segs_a[i][-1] -= gap
+            segs_a[i + 1][0] += gap
+
     nan = np.array([np.nan])
     alphas = np.concatenate([s for pair in zip(segs_a, [nan] * len(segs_a))
                               for s in pair][:-1])  # drop trailing NaN
@@ -2872,9 +2897,15 @@ def _build_density_curve(pool_alphas, pool_w, r_alphas, r_rates,
     keep = ~np.isfinite(a) | ((a > alpha_pool_top + 1e-9) & (a <= alpha_top + 1e-9))
     a_cim = a[keep]
     w_cim = _market_density(a_cim, np.asarray(r_rates, dtype=float)[keep], g.beta)
+    # Where the density is zero NOBODY lends -- after ironing, the stretch
+    # between the entrants' cutoff and alpha_0 is served by neither side.  That
+    # is an empty piece of the support, so break the line there instead of
+    # letting it plunge to the floor of the log axis and back.
+    pool_w = np.asarray(pool_w, dtype=float).copy()
+    pool_w[~(pool_w > 0)] = np.nan
     nan = np.array([np.nan])
     return (np.concatenate([np.asarray(pool_alphas, dtype=float), nan, a_cim]),
-            np.concatenate([np.asarray(pool_w, dtype=float), nan, w_cim]))
+            np.concatenate([pool_w, nan, w_cim]))
 
 
 def _ns_capital(rate, alpha_top, badleftover):
@@ -3010,8 +3041,13 @@ def solve_for_config(name):
         # so the pooling piece runs from α₀^E, not from α₀.
         ea = g.entry_analytical
         if ea is not None:
+            # Post-entry total = incumbent floor + IRONED entrant density.
+            # Not max(w_total, w_incumbent): that is the floor plus the raw
+            # closed-form entry, which puts entry on the stretches Step 6's
+            # ironing removes (the components of N^E reach further left than
+            # the set where the closed form is negative).
             w_pool_alphas, w_pool = _pooling_density_trim(
-                ea['alphas'], np.maximum(ea['w_total'], ea['w_incumbent']),
+                ea['alphas'], ea['w_incumbent'] + ea['wE'],
                 g.rpE, ea['KE'])
         else:
             w_pool_alphas, w_pool = _pooling_density_trim(
