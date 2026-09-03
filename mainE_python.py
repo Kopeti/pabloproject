@@ -2872,8 +2872,28 @@ def _pooling_density_trim(alphas, w, pooling_rate, K_pool, margin=0.02):
     keep = (np.asarray(pooling_rate, dtype=float) -
             np.asarray(K_pool, dtype=float)) >= margin
     if not np.any(keep):          # degenerate calibration: keep everything
-        return np.asarray(alphas, dtype=float), np.asarray(w, dtype=float)
-    return np.asarray(alphas, dtype=float)[keep], np.asarray(w, dtype=float)[keep]
+        keep = np.ones(len(np.asarray(alphas)), dtype=bool)
+    return (np.asarray(alphas, dtype=float)[keep],
+            np.asarray(w, dtype=float)[keep], keep)
+
+
+def _break_at_entry_edges(alphas, w, wE):
+    """Insert a NaN wherever entry starts or stops.
+
+    w^E drops discontinuously to zero at the edge of a no-entry interval
+    (Step 6), so the total density steps down to the incumbent floor there.
+    Without a break matplotlib draws a sloped connector across the step, which
+    reads as a small dip in the curve rather than the discontinuity it is.
+    """
+    active = np.asarray(wE, dtype=float) > 0
+    out_a, out_w = [], []
+    for i in range(len(alphas)):
+        if i > 0 and active[i] != active[i - 1]:
+            out_a.append(np.nan)
+            out_w.append(np.nan)
+        out_a.append(alphas[i])
+        out_w.append(w[i])
+    return np.array(out_a, dtype=float), np.array(out_w, dtype=float)
 
 
 def _build_density_curve(pool_alphas, pool_w, r_alphas, r_rates,
@@ -2984,10 +3004,10 @@ def solve_for_config(name):
     # Capital density w(α) on the selective range, plus the α = 0 atom held by
     # the non-selective lenders.
     K_pool_inc = np.array([_scalar(cfun(a)) for a in g.baseline_alphas_fine]) + g.Pi
+    _a_inc, _w_inc, _ = _pooling_density_trim(
+        g.baseline_alphas_fine, g.baseline_w_fine, g.rp, K_pool_inc)
     w_inc_alphas, w_inc_plot = _build_density_curve(
-        *_pooling_density_trim(g.baseline_alphas_fine, g.baseline_w_fine,
-                               g.rp, K_pool_inc),
-        r_inc_alphas, r_inc_plot, g.alpha1, g.alpha2)
+        _a_inc, _w_inc, r_inc_alphas, r_inc_plot, g.alpha1, g.alpha2)
     WNS_inc = _ns_capital(r_NS_inc, g.alpha2, g.badleftover)
 
     result = {
@@ -3046,11 +3066,22 @@ def solve_for_config(name):
             # closed-form entry, which puts entry on the stretches Step 6's
             # ironing removes (the components of N^E reach further left than
             # the set where the closed form is negative).
-            w_pool_alphas, w_pool = _pooling_density_trim(
-                ea['alphas'], ea['w_incumbent'] + ea['wE'],
-                g.rpE, ea['KE'])
+            #
+            # Trim on the INCUMBENT margin, not the entrant's.  Above the
+            # ironing cutoff w^E is zero and the curve IS the incumbent
+            # density, so the entrant criterion (r_pE - K^E, which runs out
+            # much earlier wherever K^E > K) would truncate a curve that is
+            # perfectly well defined -- on the alpha=0 dip it cut the blue
+            # line at 0.370 while the green ran to 0.391.  The entrant closed
+            # form needs no separate guard here: ironing has already zeroed
+            # w^E wherever it approaches its own boundary.
+            K_inc_on_E = np.array([_scalar(cfun(a)) for a in ea['alphas']]) + g.Pi
+            w_pool_alphas, w_pool, _keep = _pooling_density_trim(
+                ea['alphas'], ea['w_incumbent'] + ea['wE'], g.rp, K_inc_on_E)
+            w_pool_alphas, w_pool = _break_at_entry_edges(
+                w_pool_alphas, w_pool, ea['wE'][_keep])
         else:
-            w_pool_alphas, w_pool = _pooling_density_trim(
+            w_pool_alphas, w_pool, _ = _pooling_density_trim(
                 g.baseline_alphas_fine, g.baseline_w_fine, g.rp, K_pool_inc)
         w_E_alphas, w_E_plot = _build_density_curve(
             w_pool_alphas, w_pool, r_E_alphas, r_E_plot,
