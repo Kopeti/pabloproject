@@ -1438,6 +1438,198 @@ def fit_cfunE_smooth(alpha0E, alpha1E, n_fit=300, smoothing=0):
 # Analytical entry equilibrium — Region I (pooling)
 # =============================================================================
 
+def _entry_no_entry_tail(i, GE, BE, w_incumbent, B0_tilde, g_tilde, b_tilde,
+                         Gamma_req_E, beta, D_rpE, da, early_stop=False,
+                         stop_above=0.0):
+    """Propagate (G^E, B^E) forward from index i with the entrants absent.
+
+    Step 6 of the entry proof.  If entrant entry stops at α_L = alphas[i], the
+    incumbents are still in place and keep lending at w(α), so along the tail
+
+        θ^E(s) = w(s) / (D(r_p^E) T^E(s; α_L))
+        dG^E/dα = −θ^E G^E + (1−β) g̃(ω_g(α))
+        dB^E/dα = −θ^E B^E − β b̃(ω_b(α)) E^E(α)
+
+    which is the baseline frozen-pool propagation of credit_model.iron_region1
+    thinned by Λ(α;α_L) = exp(−∫θ^E).  With w ≡ 0 the two coincide.
+
+    Returns (m, G_path, B_path), where m is the maximum of
+    γ^E(α;α_L) − Γ^E_req(α) over the tail: i is in N^E iff m exceeds the
+    caller's tolerance.  With early_stop the walk returns as soon as m passes
+    `stop_above` and the paths come back as None — enough for the membership
+    test, which is all the component scan needs.  G_path/B_path are indexed
+    from i+1.
+    """
+    n = len(Gamma_req_E)
+    G_path = np.empty(n - i - 1)
+    B_path = np.empty(n - i - 1)
+    G_st, B_st = GE[i], BE[i]
+    m = -np.inf
+    for k in range(i + 1, n):
+        T_st = G_st + B_st
+        th = (w_incumbent[k] / (D_rpE * T_st)) if T_st > 1e-15 else 0.0
+        E_st = B_st / max(B0_tilde[k], 1e-15)
+        G_st = max((1 - th * da) * G_st + (1 - beta) * g_tilde[k] * da, 0.0)
+        B_st = max((1 - th * da) * B_st - beta * b_tilde[k] * E_st * da, 0.0)
+        G_path[k - i - 1] = G_st
+        B_path[k - i - 1] = B_st
+        T_k = G_st + B_st
+        v = (G_st / T_k if T_k > 1e-15 else 1.0) - Gamma_req_E[k]
+        if v > m:
+            m = v
+        if early_stop and m > stop_above:
+            return m, None, None
+    return m, G_path, B_path
+
+
+def _iron_entry(alphas, GE, BE, EE, TE, gammaE, w_total, w_incumbent, KE,
+                B0_tilde, g_tilde, b_tilde, beta, rpE, D_rpE, da,
+                w_tol_rel=1e-8, n_tol=None):
+    """Ironing of the entrant Region-I density — Step 6 of the entry proof.
+
+    The no-entry intervals are the connected components of
+
+        N^E = { α̃ : γ^E(α; α̃) > (1+K^E(α))/(1+r_p^E) for some α > α̃ },
+
+    NOT the set on which the closed-form w^E is negative; the latter is in
+    general strictly smaller, and stopping entry there can leave a pool that
+    incumbent lending alone improves past the entrants' break-even
+    requirement, so that free entry fails on the interior of the interval.
+
+    Membership is tested point by point and the components are read off
+    directly, rather than by iron_region1's downward scan for a left edge plus
+    tangency argmax.  That shortcut assumes the frozen tail from the left edge
+    touches the bound again, which pins the right edge; in the entry problem
+    it often does not — the tail can stay strictly below the bound all the way
+    to α_1^E, so entry simply never resumes — and the argmax then returns a
+    spurious interior point.  Testing membership is the definition itself and
+    costs O(n^2) cheap steps with the early exit.
+
+    The other difference from the baseline: the tail is propagated by
+    _entry_no_entry_tail (incumbents keep lending) rather than held frozen.
+
+    GE/BE/EE/TE/gammaE are corrected in place on each component.
+    Returns {'active', 'wE', 'intervals', 'diagnostics'}.
+    """
+    n = len(alphas)
+    deficit = w_total - w_incumbent          # the closed-form w^E
+    scale = max(1.0, float(np.max(np.abs(deficit))))
+    wE = np.maximum(0.0, deficit)
+    if np.min(deficit) >= -w_tol_rel * scale:
+        return {'active': False, 'wE': wE, 'intervals': [], 'diagnostics': []}
+
+    Gamma_req_E = (1 + KE) / (1 + rpE)
+    # Membership tolerance.  At a cutoff where the closed form has w^E > 0 the
+    # propagated path leaves γ^E just below Γ^E_req, so the test compares two
+    # quantities that agree by construction and the forward-Euler error decides
+    # the sign: on the shipped grids that noise is ~2e-5, against genuine
+    # violations of 1e-2 to 3e-1.  The integrator is O(da) accurate, so da is
+    # the natural threshold and sits three orders below either.
+    if n_tol is None:
+        n_tol = da
+    args = (GE, BE, w_incumbent, B0_tilde, g_tilde, b_tilde,
+            Gamma_req_E, beta, D_rpE, da)
+
+    # Γ^E_req > 1 asks for a pool of more than 100% good borrowers, so no
+    # entrant can break even there.  Where that holds over the whole tail, the
+    # cutoff is trivially outside N^E and the walk can be skipped.
+    req_min_suffix = np.minimum.accumulate(Gamma_req_E[::-1])[::-1]
+
+    # Every α̃ where the closed form demands w^E < 0 is in N^E: the zero-profit
+    # path there calls for less total lending than the incumbents already
+    # supply, so stopping entry at α̃ leaves MORE depletion than the path wants
+    # and hence a pool strictly better than break-even just above α̃.  Start
+    # from that set -- it is exact, needs no tail walk, and is the coverage
+    # ironing exists to repair.
+    in_N = deficit < -w_tol_rel * scale
+
+    # Then extend each stretch to the LEFT: entry has to stop early enough that
+    # the incumbent-only tail never beats break-even.  This is iron_region1's
+    # downward scan, and it is the only place the tail test is needed.  Nothing
+    # strictly to the right of every infeasible stretch can be in N^E: the
+    # closed form is feasible there, so stopping leaves LESS depletion than the
+    # path wants, making the pool worse rather than better.
+    run_starts = []
+    i = 0
+    while i < n:
+        if not in_N[i]:
+            i += 1
+            continue
+        run_starts.append(i)
+        while i < n and in_N[i]:
+            i += 1
+    for s in run_starts:
+        j = s - 1
+        while j >= 0 and not in_N[j]:
+            if req_min_suffix[j + 1] >= 1.0:
+                break
+            m_j, _, _ = _entry_no_entry_tail(j, *args, early_stop=True,
+                                             stop_above=n_tol)
+            if m_j <= n_tol:
+                break
+            in_N[j] = True
+            j -= 1
+
+    # Connected components of N^E.
+    comps = []
+    i = 0
+    while i < n:
+        if not in_N[i]:
+            i += 1
+            continue
+        s = i
+        while i < n and in_N[i]:
+            i += 1
+        comps.append((s, i - 1))
+
+    T_scale = max(float(np.max(TE)), 1e-15)   # before TE is mutated below
+    intervals, diagnostics = [], []
+    for (s, e) in comps:
+        i_L = max(s - 1, 0)
+        resid, G_path, B_path = _entry_no_entry_tail(i_L, *args)
+
+        # Entry resumes at the right edge only if the closed form is actually
+        # active there: an entrant must be able to break even (Γ^E_req < 1) and
+        # the zero-profit path must call for positive lending.  Otherwise the
+        # component runs to α_1^E.
+        terminal = (e >= n - 1) or (Gamma_req_E[e + 1] >= 1.0
+                                    or w_total[e + 1] <= 0.0)
+        k_hi = n if terminal else e + 1
+        ks = np.arange(i_L + 1, k_hi)
+        if len(ks):
+            GE[ks] = G_path[ks - i_L - 1]
+            BE[ks] = B_path[ks - i_L - 1]
+            TE[ks] = GE[ks] + BE[ks]
+            EE[ks] = BE[ks] / np.maximum(B0_tilde[ks], 1e-15)
+            gammaE[ks] = np.where(TE[ks] > 1e-15, GE[ks] / TE[ks], 1.0)
+            wE[ks] = 0.0
+        wE[s:k_hi] = 0.0
+
+        # At a non-terminal right edge the closed form resumes; report how well
+        # the propagated state matches the closed-form state there.  Normalised
+        # by the largest pool mass rather than pointwise: near the top of the
+        # region the closed-form state itself vanishes, and a pointwise ratio
+        # there reports a huge error for a negligible absolute one.
+        if terminal:
+            mismatch = None
+        else:
+            gp, bp = G_path[e + 1 - i_L - 1], B_path[e + 1 - i_L - 1]
+            mismatch = (abs(gp - GE[e + 1]) / T_scale,
+                        abs(bp - BE[e + 1]) / T_scale)
+
+        intervals.append((float(alphas[s]), float(alphas[e])))
+        diagnostics.append({
+            'a_L': float(alphas[i_L]),
+            'a_R': float(alphas[min(e + 1, n - 1)]),
+            'max_entrant_profit_resid': float(resid),
+            'state_mismatch_at_resume': mismatch,
+            'terminal': bool(terminal),
+        })
+
+    return {'active': True, 'wE': wE, 'intervals': intervals,
+            'diagnostics': diagnostics}
+
+
 def solve_entry_pooling_analytical(rpE, alpha0E, alpha1E, n_pts=500,
                                    cfunE_poly_info=None):
     """
@@ -1562,66 +1754,24 @@ def solve_entry_pooling_analytical(rpE, alpha0E, alpha1E, n_pts=500,
                                 (1 - beta) * gpriorfun_scalar(beta + a_j * (1 - beta)))
     w_incumbent = w_inc_pooling + w_inc_cim
 
-    # Entry density: entrants active only where the zero-profit total exceeds
-    # the incumbent floor (Step 6 of the entry proof).
-    wE = np.maximum(0, w_total - w_incumbent)
-
-    # --- Entry-side Step-6 forward pass -----------------------------------
-    # On suspended stretches (total required < incumbent floor) the pool does
-    # NOT follow the zero-profit closed form: incumbents keep lending, so the
-    # state (G^E, B^E) evolves by incumbent-only depletion at r_pE.  Propagate
-    # it, overwrite the state arrays there, and report (i) the entrant-profit
-    # residual inside (the text's Step 6 notes incumbent capital alone may
-    # generate excess quality, i.e. a positive residual — the boundary
-    # adjustment for that case runs through Step 3's alpha1'E, not here) and
-    # (ii) the state mismatch where the closed form resumes.
-    suspended = w_total < w_incumbent
-    suspended_intervals = []
-    suspension_diags = []
-    if np.any(suspended) and not np.all(suspended):
-        Gamma_req_E = (1 + KE) / (1 + rpE)
-        j = 0
-        n_g = len(alphas)
-        while j < n_g:
-            if not suspended[j]:
-                j += 1
-                continue
-            s = j
-            while j < n_g and suspended[j]:
-                j += 1
-            e = j  # suspension on [s, e)
-            G_st = GE[s - 1] if s > 0 else GE[0]
-            B_st = BE[s - 1] if s > 0 else BE[0]
-            max_resid = -np.inf
-            for k in range(s, e):
-                T_st = G_st + B_st
-                th_inc = (w_incumbent[k] / (D_rpE * T_st)) if T_st > 1e-15 else 0.0
-                E_st = B_st / max(B0_tilde[k], 1e-15)
-                G_next = (1 - th_inc * da) * G_st + (1 - beta) * g_tilde[k] * da
-                B_next = (1 - th_inc * da) * B_st - beta * b_tilde[k] * E_st * da
-                G_st, B_st = max(G_next, 0.0), max(B_next, 0.0)
-                GE[k], BE[k] = G_st, B_st
-                EE[k] = B_st / max(B0_tilde[k], 1e-15)
-                TE[k] = G_st + B_st
-                gam_k = G_st / TE[k] if TE[k] > 1e-15 else 1.0
-                gammaE[k] = gam_k
-                max_resid = max(max_resid, gam_k - Gamma_req_E[k])
-            if e < n_g:
-                mismatch = (abs(G_st - GE[e]) / max(abs(GE[e]), 1e-15),
-                            abs(B_st - BE[e]) / max(abs(BE[e]), 1e-15))
-            else:
-                mismatch = None
-            suspended_intervals.append((float(alphas[s]),
-                                        float(alphas[min(e, n_g - 1)])))
-            suspension_diags.append({
-                'max_entrant_profit_resid': float(max_resid),
-                'state_mismatch_at_resume': mismatch,
-            })
-        print(f"  Entry Step-6: suspended stretches "
+    # --- Step 6: ironing ---------------------------------------------------
+    # Entrants are active where the zero-profit total exceeds the incumbent
+    # floor.  Where it does not, the no-entry intervals are the components of
+    # N^E, found by _iron_entry -- not the set where the closed form is
+    # negative, which would leave entrants strictly profitable inside.
+    _ir = _iron_entry(alphas, GE, BE, EE, TE, gammaE, w_total, w_incumbent,
+                      KE, B0_tilde, g_tilde, b_tilde, beta, rpE, D_rpE, da)
+    wE = _ir['wE']
+    suspended_intervals = _ir['intervals']
+    suspension_diags = _ir['diagnostics']
+    if _ir['active']:
+        print(f"  Entry Step-6 ironing: no-entry intervals "
               f"{[(round(a, 4), round(b, 4)) for (a, b) in suspended_intervals]}")
         for d_ in suspension_diags:
-            print(f"    max entrant-profit residual inside: "
-                  f"{d_['max_entrant_profit_resid']:.3e}"
+            print(f"    a_L={d_['a_L']:.4f}, a_R={d_['a_R']:.4f}"
+                  + ("  [reaches alpha1E, no resumption]" if d_['terminal'] else "")
+                  + f"; max entrant-profit residual "
+                    f"{d_['max_entrant_profit_resid']:.3e}"
                   + (f"; state mismatch at resume (G,B): "
                      f"({d_['state_mismatch_at_resume'][0]:.2e}, "
                      f"{d_['state_mismatch_at_resume'][1]:.2e})"
