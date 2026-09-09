@@ -216,7 +216,10 @@ def _precompute_cum_states(rate, matlab_gammaupdate2=False):
     matlab_gammaupdate2: if True, uses the MATLAB gammaupdate2.m formula
         (denom / dfun_r) instead of the inline formula (denom * dfun_r).
         These differ by r^2.  gammaupdate2.m uses the former; gam0E.m and
-        main.m inline use the latter.
+        main.m inline use the latter.  The MATLAB convention is reached only
+        through gammaupdate2, i.e. by the selection-preserving (SP) cost
+        kinds of figures 7/9; none of the Appendix-D figures (8, 10a/b, 11)
+        use it.
     """
     n_inc = len(g.almass)
     n_om = len(g.omvec)
@@ -1036,7 +1039,9 @@ def _band_capital(al_start, n_pts=100):
     """Total capital required along the Region-IIb band [al_start, alpha2].
 
     Integrates the non-selective density (eq:wNSE-proof) plus the top-market
-    term (draft Step 8).  phi is forced weakly decreasing: on sub-intervals
+    term and the boundary atom (draft Step 8; the atom is the general boundary
+    condition phi(alpha_2^E) = min(K^E,K)/K, which the appendix's earlier
+    phi(alpha_2^E) = 1 is the K <= K^E case of).  phi is forced weakly decreasing: on sub-intervals
     where the raw slice-clearing ratio (fifunE) would rise, the non-selective
     threat is not binding — no NS capital enters there, phi is held flat and
     those markets clear at the incumbent capital-clearing rate below rtilde
@@ -1060,7 +1065,10 @@ def _band_capital(al_start, n_pts=100):
                  (g.badleftoverE + quad(gpriorfun_scalar,
                                         g.beta + g.alpha2 * (1 - g.beta), 1)[0]) *
                  _scalar(dfun(rtildeafunE(g.alpha2, al_start))))
-    return np.sum(WNSvec * np.diff(vec)) + WNSEattop
+    # Boundary atom (general Step-8 boundary condition, see _boundary_atom):
+    # phi(alpha_2^E) = min(K^E, K)/K, zero atom iff K <= K^E at the boundary.
+    _, atom0 = _boundary_atom(al_start)
+    return np.sum(WNSvec * np.diff(vec)) + WNSEattop + atom0
 
 
 def _incumbent_cim_rate(al):
@@ -1073,9 +1081,8 @@ def _incumbent_cim_rate(al):
     rhat = K(alpha), so K is the comparator, as before.
     """
     al = _scalar(al)
-    if al <= g.alpha1 and hasattr(g, 'rhat'):
-        ind = int(np.argmin((al - g.almassshort) ** 2))
-        return _scalar(g.rhat[ind])
+    if al <= g.alpha1 and hasattr(g, 'rhat_alphas'):
+        return float(np.interp(al, g.rhat_alphas, g.rhat))
     return _scalar(cfun(al)) + g.Pi
 
 
@@ -1117,9 +1124,8 @@ def rfunE(al, al0, al1, al2):
         elif al[i] <= g.alpha1:
             # Step 9: r_CIM^E = min(rhat, K^E) — the K^E cap was missing
             # (audit item 4.1); moot in the shipped calibrations.
-            diffs = (al[i] - g.almassshort)**2
-            ind = np.argmin(diffs)
-            r[i] = min(_scalar(g.rhat[ind]), _scalar(cfunE(al[i])) + g.PiE)
+            r[i] = min(float(np.interp(al[i], g.rhat_alphas, g.rhat)),
+                       _scalar(cfunE(al[i])) + g.PiE)
         elif al[i] <= min(al2, g.alpha2):
             r[i] = min(_scalar(cfun(al[i])) + g.Pi, _scalar(cfunE(al[i])) + g.PiE)
         elif al[i] <= g.alpha2:
@@ -1143,6 +1149,143 @@ def prof0Efun(r):
     )
     al0E = res.x
     return gam0E(al0E, r, cum_gd_r, cum_bd_r) * (1 + r) - _scalar(cfunE(al0E)) - 1 - g.PiE
+
+
+# =============================================================================
+# Analytical Steps 2-4 and Step-7 input of the entry construction (App. A.10)
+# =============================================================================
+
+# The legacy discrete Region-I loop (MATLAB mainE.m) has no Step-6 ironing and
+# does not converge to the appendix construction where ironing is active.  It
+# is kept only for convergence_test; the analytical Step 5-6 solver
+# (solve_entry_pooling_analytical) is the Region-I solver of record.
+USE_DISCRETE_REGION1 = False
+
+
+def _pool_grid_inputs():
+    """Prior-dependent inputs on the baseline fine grid, cached on g."""
+    if not hasattr(g, '_pool_grid') or g._pool_grid[0] is not g.baseline_alphas_fine:
+        beta = g.beta
+        alphas = g.baseline_alphas_fine
+        om_g = beta + alphas * (1 - beta)
+        om_b = 1 - beta + alphas * beta
+        g_t = np.array([gpriorfun_scalar(x) for x in om_g])
+        b_t = np.array([bpriorfun_scalar(x) for x in om_b])
+        B0 = np.array([quad(bpriorfun_scalar, x, 1)[0] for x in om_b])
+        G0 = quad(gpriorfun_scalar, 0, om_g[0])[0]
+        g._pool_grid = (alphas, g_t, b_t, B0, G0)
+    return g._pool_grid
+
+
+def _incumbent_only_pool(r):
+    """Pool faced by an atomistic entrant when only the incumbents lend, at rate r.
+
+    Step 2 of the entry proof evaluates gamma^E at zero entrant mass: the
+    baseline incumbent density w(alpha) is in place and lends at the trial
+    pooling rate r.  Forward-propagate the accepted pool (G, B) on the baseline
+    fine grid from the fresh pool at alpha_0 with the update of
+    _entry_no_entry_tail:
+
+        theta = w/(D(r) T),  dG = -theta G + (1-beta) g~,  dB = -theta B - beta b~ E.
+
+    At r = r_p this reproduces the closed-form baseline pool up to the Euler
+    error.  Returns (alphas, G, B) on g.baseline_alphas_fine.
+    """
+    alphas, g_t, b_t, B0, G0 = _pool_grid_inputs()
+    beta = g.beta
+    w = g.baseline_w_fine
+    n = len(alphas)
+    da = alphas[1] - alphas[0] if n > 1 else 1e-6
+    D_r = _scalar(dfun(r))
+    G = np.empty(n)
+    B = np.empty(n)
+    G[0] = G0
+    B[0] = B0[0]
+    for k in range(1, n):
+        T = G[k - 1] + B[k - 1]
+        th = (w[k - 1] / (D_r * T)) if T > 1e-15 else 0.0
+        E = B[k - 1] / max(B0[k - 1], 1e-15)
+        G[k] = max((1 - th * da) * G[k - 1] + (1 - beta) * g_t[k - 1] * da, 0.0)
+        B[k] = max((1 - th * da) * B[k - 1] - beta * b_t[k - 1] * E * da, 0.0)
+    return alphas, G, B
+
+
+def _entry_breakeven_gap(r):
+    """Step 2:  f(r) = min_{alpha <= alpha_1} (1+K^E(alpha))/gamma^E(alpha; r) - 1 - r.
+
+    Negative means some entrant breaks even at a pooling rate below r.  Returns
+    (f(r), minimising alpha).  Below alpha_0 no incumbent lends, so the entrant
+    faces the fresh pool (gam0).  The last three grid points are dropped: at the
+    top of the pooling region T -> 0 and G/T is a 0/0 ratio.  Requires
+    g._KE_fine / g._al_low / g._KE_low (set in run_mainE).
+    """
+    alphas, G, B = _incumbent_only_pool(r)
+    T = G + B
+    n = len(alphas)
+    valid = T > 1e-10
+    valid[max(n - 3, 0):] = False
+    gam = np.where(valid, G / np.maximum(T, 1e-300), np.nan)
+    be = np.where(valid, (1.0 + g._KE_fine) / gam - 1.0, np.nan)
+    be_low = np.array([(1.0 + ke) / gam0(a) - 1.0
+                       for a, ke in zip(g._al_low, g._KE_low)])
+    al_all = np.concatenate([g._al_low, alphas])
+    be_all = np.concatenate([be_low, be])
+    k = int(np.nanargmin(be_all))
+    return be_all[k] - r, al_all[k]
+
+
+def _leftover_bads_after_pooling(ea, rpE):
+    """B^{NS,E}: bad borrowers not served in the post-entry pooling region (Step 7 input).
+
+        B^{NS,E} = B(1) - int (w_inc + w^E)/D(r_p^E) * s  dalpha  over the pooling region,
+
+    s = bad share of the accepted pool: (r_p^E - K^E)/(1 + r_p^E) where entrants
+    are active (the zero-profit condition, exact), B^E/T^E from the propagated
+    state on the ironed intervals.  If the entrants' region starts above
+    alpha_0, the incumbents on [alpha_0, alpha_0^E) lend at r_p^E on their own
+    (incumbent-only propagation).  ea=None: incumbents only, whole pooling
+    region, rate rpE (at rpE = r_p this returns g.badleftover).
+
+    Convention kept from the legacy code: bad borrowers still inside a
+    Region-II lender's acceptance region at alpha_1^E count as leftover (Step 9
+    serves goods only).
+    """
+    B_total = quad(bpriorfun_scalar, 0, 1)[0]
+    D_r = _scalar(dfun(rpE))
+    al_pre, G_pre, B_pre = _incumbent_only_pool(rpE)
+    da_pre = al_pre[1] - al_pre[0] if len(al_pre) > 1 else 1e-6
+    T_pre = G_pre + B_pre
+    s_pre = np.where(T_pre > 1e-15, B_pre / np.maximum(T_pre, 1e-300), 0.0)
+    if ea is None:
+        served = np.sum(g.baseline_w_fine / D_r * s_pre) * da_pre
+        return B_total - served
+    served = 0.0
+    alphas = ea['alphas']
+    if alphas[0] > al_pre[0] + 1e-12:
+        m = al_pre < alphas[0]
+        served += np.sum(g.baseline_w_fine[m] / D_r * s_pre[m]) * da_pre
+    w_tot = ea['w_incumbent'] + ea['wE']
+    active = ea['wE'] > 0
+    s_zp = (rpE - ea['KE']) / (1.0 + rpE)
+    s_prop = np.where(ea['TE'] > 1e-15, ea['BE'] / np.maximum(ea['TE'], 1e-300), 0.0)
+    s = np.clip(np.where(active, s_zp, s_prop), 0.0, 1.0)
+    served += np.sum(w_tot / D_r * s) * ea['da']
+    return B_total - served
+
+
+def _boundary_atom(al_start):
+    """Step 8 boundary condition: phi(alpha_2^E) = min(K^E, K)/K and the NS atom there.
+
+    When K^E < K at the band's start, selective entrants served the share
+    1 - phi of the boundary slice just below alpha_2^E and cannot break even
+    inside the band (rtilde < K^E); non-selective capital takes that share over
+    at the boundary market and, lending pro rata, absorbs the same fraction of
+    the whole leftover pool.  Returns (phi0, atom0); atom0 = 0 iff K <= K^E.
+    """
+    phi0 = _scalar(fifunE(np.array([al_start]), al_start))
+    P0 = g.badleftoverE + quad(gpriorfun_scalar, g.beta + al_start * (1 - g.beta), 1)[0]
+    atom0 = (1.0 - phi0) * P0 * _scalar(dfun(rtildeafunE(al_start, al_start)))
+    return phi0, max(atom0, 0.0)
 
 
 # =============================================================================
@@ -1853,95 +1996,84 @@ def run_mainE():
     print("  Pre-computing incumbent states...")
     g._cum_gd_rp, g._cum_bd_rp = _precompute_cum_states(g.rp, matlab_gammaupdate2=True)
 
-    # ---------- Finding alpha0E and rpE, alpha1Emin ----------
-    print("  Finding alpha0E, rpE...")
-
-    # MATLAB uses fzero (bracket-based), not fsolve (Newton-based).
-    # fzero starts at rp and expands outward to find a sign change,
-    # then uses bisection/interpolation within the bracket.
-    f_rp = prof0Efun(g.rp)
-    rp0 = g.rp
-    if f_rp > 0:
-        # Search downward from rp for sign change (mimics fzero's bracket search)
-        step = g.rp / 50.0
-        for k in range(1, 100):
-            r_try = g.rp - k * step
-            if r_try <= 0:
-                break
-            f_try = prof0Efun(r_try)
-            if f_try < 0:
-                rp0 = brentq(prof0Efun, r_try, g.rp)
-                break
-    elif f_rp < 0:
-        # Search upward
-        step = g.rp / 50.0
-        for k in range(1, 100):
-            r_try = g.rp + k * step
-            f_try = prof0Efun(r_try)
-            if f_try > 0:
-                rp0 = brentq(prof0Efun, g.rp, r_try)
-                break
-
-    if rp0 < g.rp:
-        g.rpE = rp0
-        # Pre-compute cumulative states at rpE for gam0E
-        cum_gd_rpE, cum_bd_rpE = _precompute_cum_states(g.rpE)
-        res = minimize_scalar(
-            lambda alpha: _scalar(cfunE(alpha)) - gam0E(alpha, g.rpE, cum_gd_rpE, cum_bd_rpE) * (1 + g.rpE),
-            bounds=(0, 1), method='bounded'
-        )
-        g.alpha0E = res.x
+    # ---------- Steps 2-4: marginal entrant, pooling rate, pooling boundaries ----------
+    # Analytical (Appendix A.10, Steps 2-4).  The legacy version rebuilt the
+    # incumbent-depleted pool on the omega grid from the Delta-discretised
+    # masses; near alpha_1 that pool is ~1e-5 and the ratio G/(G+B) explodes,
+    # which the bounded search over alpha in [0,1] picked up as a spurious
+    # break-even (frontier calibration: rpE 1.283 vs rp 1.293 with a "marginal
+    # entrant" at 0.382 whose true break-even rate is 1.70).
+    print("  Step 2: marginal entrant and post-entry pooling rate...")
+    g._KE_fine = np.array([g.PiE + _scalar(cfunE(a)) for a in g.baseline_alphas_fine])
+    g._al_low = np.linspace(0.005, max(g.alpha0 - 1e-6, 0.005), 60)
+    g._KE_low = np.array([g.PiE + _scalar(cfunE(a)) for a in g._al_low])
+    gap_rp, al_rp = _entry_breakeven_gap(g.rp)
+    if gap_rp >= 0.0:
+        g.rpE = g.rp
+        g.alpha0E = g.alpha0      # entrant pooling region empty; downstream needs a value
+        g.alpha1E = g.alpha1
+        alpha1Emin = g.alpha1
+        print(f"  Step 2: min break-even rate over alpha<=alpha1 = {gap_rp + g.rp:.4f} "
+              f"(at alpha={al_rp:.4f}) >= rp = {g.rp:.4f}: no entry in the pooling region")
     else:
-        g.rpE = g.rp  # no entry in the pooling region
+        # f(r) rises as r falls (less incumbent depletion, and the -r term), so
+        # bracket downward from rp and take the unique root.
+        step = g.rp / 50.0
+        r_hi, r_lo = g.rp, None
+        for k in range(1, 200):
+            r_try = g.rp - k * step
+            if r_try <= 1e-6:
+                break
+            if _entry_breakeven_gap(r_try)[0] > 0.0:
+                r_lo = r_try
+                break
+            r_hi = r_try
+        if r_lo is None:
+            raise RuntimeError("Step 2: no bracket for the post-entry pooling rate")
+        g.rpE = brentq(lambda r: _entry_breakeven_gap(r)[0], r_lo, r_hi, xtol=1e-9)
+        g.alpha0E = _entry_breakeven_gap(g.rpE)[1]
+
+        # Step 4: indifference boundary K^E(alpha_1''^E) = rpE
+        if _scalar(cfunE(1.0)) < g.rpE - g.PiE:
+            alpha1Emin = 1.0      # K^E(1) < rpE: no end of pooling
+        else:
+            f4 = lambda a: _scalar(cfunE(a)) - (g.rpE - g.PiE)
+            alpha1Emin = g.alpha0E if f4(g.alpha0E) >= 0 else brentq(f4, g.alpha0E, 1.0)
+        if alpha1Emin > g.alpha1 + 1e-9:
+            print(f"  WARNING: K^E(alpha1) < rpE (alpha1''^E = {alpha1Emin:.4f} > alpha1): "
+                  "entrants above alpha_1 undercut the pooling market -- outside the "
+                  "cases of Appendix A.10")
+
+    # ---------- Step 3: cash-in-the-market rate rhat on the pooling grid ----------
+    # rhat(alpha) solves w(alpha) = D(rhat) g(omega_g(alpha)) (1-beta) with the
+    # analytical incumbent density (the legacy code used the Delta-mass at the
+    # first grid point, off by 1/Delta there).  The top of the pooling grid
+    # carries the 0*inf artifact of the closed-form density (see
+    # _pooling_density_trim); those points inherit the last reliable value.
+    _al = g.baseline_alphas_fine
+    _w = g.baseline_w_fine
+    _gt = np.array([gpriorfun_scalar(g.beta + a * (1 - g.beta)) for a in _al])
+    _rhat = np.where(_w > 0,
+                     dfuninv(np.where(_w > 0, _w, 1.0) / ((1 - g.beta) * _gt)),
+                     np.inf)
+    _K_inc = np.array([_scalar(cfun(a)) for a in _al]) + g.Pi
+    _reliable = (g.rp - _K_inc) >= 0.02
+    if np.any(_reliable):
+        _last = int(np.where(_reliable)[0][-1])
+        _rhat[_last + 1:] = _rhat[_last]
+    g.rhat_alphas = _al
+    g.rhat = _rhat
+
+    if g.rpE < g.rp:
+        # alpha_1'^E: smallest alpha such that rhat >= rpE on [alpha, alpha_1]
+        _viol = np.where(_rhat < g.rpE)[0]
+        alpha1Ep = _al[min(_viol[-1] + 1, len(_al) - 1)] if len(_viol) else g.alpha0
+        g.alpha1E = max(alpha1Ep, alpha1Emin)
+        print(f"  alpha1'^E = {alpha1Ep:.6f}   alpha1''^E = {alpha1Emin:.6f}")
 
     print(f"  rpE = {g.rpE:.6f}")
-
-    if (1 + g.rpE) - 1 - _scalar(cfunE(1.0)) > g.PiE:
-        # Even at max cost, profit is larger than PiE: no end of pooling
-        g.alpha1E = 1.0
-        alpha1Emin = 1.0
-    else:
-        alpha1Emin = fsolve(
-            lambda alpha: _scalar(cfunE(alpha)) - (g.rpE - g.PiE), g.alpha0E
-        )[0]
-
-    if g.rpE == g.rp:
-        g.alpha0E = alpha1Emin  # if no entry in pooling, jump over
-
     print(f"  alpha0E    = {g.alpha0E:.6f}")
-    print(f"  alpha1Emin = {alpha1Emin:.6f}")
-
-    # ---------- Calculate rhat ----------
-    # rhat: the would-be-CIM-price in the pooling region
-    g.rhat = np.zeros(len(g.almassshort))
-    g.rhat[0] = (_scalar(dfuninv(g.wmassshort[0])) * (1 - g.beta) *
-                 _scalar(gpriorfun(g.beta + g.alpha0 * (1 - g.beta))))
-    for i in range(1, len(g.almassshort) - 1):
-        integral_val = quad(gpriorfun_scalar,
-                            g.beta + g.almassshort[i-1] * (1 - g.beta),
-                            g.beta + g.almassshort[i] * (1 - g.beta))[0]
-        if integral_val > 0:
-            g.rhat[i] = _scalar(dfuninv(g.wmassshort[i] / integral_val))
-        else:
-            g.rhat[i] = g.rhat[i-1]
-
-    g.rhat[-1] = g.rhat[-2]
-
-    # ---------- Adjust alpha1E ----------
-    # alpha1E can be below alpha1 only if rhat > rpE in between
-    above = g.rhat > g.rpE
-    indexvec = np.arange(1, len(above) + 1)  # 1-indexed like MATLAB
-    # Reverse cumulative sum (intended behavior based on comments)
-    rev_cumsum = np.cumsum(above[::-1])[::-1]
-    x = np.where(rev_cumsum == (len(above) - indexvec))[0]
-
-    almassshortpl1 = np.concatenate([g.almassshort, [g.alpha1]])
-    if len(x) > 0:
-        g.alpha1E = max(alpha1Emin, np.max(almassshortpl1[x + 1]))
-    else:
-        g.alpha1E = alpha1Emin
-
-    print(f"  alpha1E = {g.alpha1E:.6f}")
+    print(f"  alpha1E    = {g.alpha1E:.6f}")
 
     # ---------- Pooling region ----------
     print("  Computing pooling region for new entrants...")
@@ -1966,7 +2098,7 @@ def run_mainE():
     gnext_E = None
     bnext_E = None
 
-    while almassE_list[-1] + g.Delta <= g.alpha1E:
+    while USE_DISCRETE_REGION1 and almassE_list[-1] + g.Delta <= g.alpha1E:
         alp = almassE_list[-1]
 
         if n >= 3:
@@ -2067,7 +2199,7 @@ def run_mainE():
     if gnext_E is None:
         gnext_E = gfunprevE.copy()
         bnext_E = bfunprevE.copy()
-        print("  [empty pooling region: skipping selective pooling entry]")
+        print("  [discrete Region-I loop not run (USE_DISCRETE_REGION1=False) or empty pooling region]")
 
     # Final gammaE
     if gnext_E is not None:
@@ -2082,65 +2214,64 @@ def run_mainE():
     wmassE = np.array(wmassE_list)
     gammaE = np.array(gammaE_list)
 
-    # ---------- Calculate badleftoverE ----------
-    if g.rpE < g.rp:
-        # There is entry in pooling
-        g.badleftoverE = np.sum(g.delom * bnext_E)
-    else:
-        # No entry in pooling
-        g.alpha1E = g.alpha1
-        g.badleftoverE = g.badleftover
-        wmassE = np.array([0.0])
-        almassE = np.array([g.alpha1E, g.alpha1E])
-
-    print(f"  badleftoverE = {g.badleftoverE:.6f}")
-
-    # ---------- Analytical entry comparison (Region I only) ----------
-    # Skip if pooling region is degenerate (α₀^E ≥ α₁^E - Δ).
+    # ---------- Region I: the analytical Step 5-6 construction is the solver ----------
+    # (The discrete loop above runs only with USE_DISCRETE_REGION1, for
+    # convergence_test.  Everything downstream -- B^{NS,E}, the three Step-7
+    # candidate rates, Region IIb, the rate panels -- is computed from the
+    # same ironed analytical solution that draws the density panel.)
     pooling_is_valid = (g.rpE < g.rp) and (g.alpha1E - g.alpha0E > g.Delta * 2)
+    g.entry_analytical = None
+    g.entry_analytical_raw = None
+    wmassE_disc = wmassE
     if pooling_is_valid:
         print("\n  --- Analytical Entry (Region I) ---")
         cfg = PARAM_CONFIGS[ACTIVE_CONFIG]
         mode, _ = _resolve_cfunE_mode(cfg)
 
-        if mode == 'simple':
-            # cfunE is already a smooth polynomial — no spline needed.
-            # Run analytical with raw cfunE directly (it IS smooth).
-            print("  [Simple cfunE — no spline needed]")
-            entry_ana = solve_entry_pooling_analytical(
-                g.rpE, g.alpha0E, g.alpha1E, cfunE_poly_info=None)
-            entry_ana_raw = entry_ana  # same thing
-            g.cfunE_poly_info = None
-        else:
-            # Complex cfunE — fit spline for smooth analytical version
+        if mode in ('smooth', 'complex'):
+            # SP cost kinds: cfunE carries omega-grid noise, fit a spline first.
             poly_info = fit_cfunE_smooth(g.alpha0E, g.alpha1E, n_fit=300)
             g.cfunE_poly_info = poly_info
-
             print("  [Spline cfunE]")
             entry_ana = solve_entry_pooling_analytical(
                 g.rpE, g.alpha0E, g.alpha1E, cfunE_poly_info=poly_info)
-
             print("  [Raw cfunE]")
             entry_ana_raw = solve_entry_pooling_analytical(
                 g.rpE, g.alpha0E, g.alpha1E, cfunE_poly_info=None)
+        else:
+            # Closed-form cost kinds are smooth: use cfunE directly.
+            print("  [Closed-form cfunE -- no spline needed]")
+            entry_ana = solve_entry_pooling_analytical(
+                g.rpE, g.alpha0E, g.alpha1E, cfunE_poly_info=None)
+            entry_ana_raw = entry_ana
+            g.cfunE_poly_info = None
 
-        # Compare: discrete vs analytical
-        WE_disc = np.sum(wmassE)
-        WE_ana = entry_ana['WE_cumsum'][-1]
-        WE_raw = entry_ana_raw['WE_cumsum'][-1]
-        print(f"\n  === Region I Entry Capital Comparison ===")
-        print(f"  Discrete            W^E = {WE_disc:.6f}")
-        print(f"  Analytical          W^E = {WE_ana:.6f}")
-        if entry_ana is not entry_ana_raw:
-            print(f"  Analytical (raw)    W^E = {WE_raw:.6f}")
-        print(f"  Analytical - Discrete   = {WE_ana - WE_disc:.6f}")
-
-        # Store for later plotting
         g.entry_analytical = entry_ana
         g.entry_analytical_raw = entry_ana_raw if entry_ana is not entry_ana_raw else None
+        g.entry_da = entry_ana['da']
+        almassE = np.append(entry_ana['alphas'], g.alpha1E)
+        wmassE = entry_ana['wE'] * entry_ana['da']
+        gammaE = entry_ana['gammaE']
+        g.badleftoverE = _leftover_bads_after_pooling(entry_ana, g.rpE)
+        print(f"  Analytical W^E (Region I) = {np.sum(wmassE):.6f}")
+        if USE_DISCRETE_REGION1:
+            print(f"  Discrete   W^E (Region I) = {np.sum(wmassE_disc):.6f}  "
+                  f"(analytical - discrete = {np.sum(wmassE) - np.sum(wmassE_disc):+.6f})")
     else:
-        g.entry_analytical = None
-        g.entry_analytical_raw = None
+        if g.rpE >= g.rp:
+            # Step 2: no entry in the pooling region.
+            g.alpha1E = g.alpha1
+            g.badleftoverE = g.badleftover
+        else:
+            # Degenerate sliver: no entrant capital, incumbents lend at rpE.
+            g.badleftoverE = _leftover_bads_after_pooling(None, g.rpE)
+        wmassE = np.array([0.0])
+        almassE = np.array([g.alpha1E, g.alpha1E])
+        g.entry_da = g.Delta
+
+    print(f"  badleftoverE = {g.badleftoverE:.6f}   (baseline identity check: "
+          f"{_leftover_bads_after_pooling(None, g.rp):.6f} vs badleftover "
+          f"{g.badleftover:.6f})")
 
     # ---------- Calculate non-selective and CIM ----------
     print("  Computing non-selective and CIM regions...")
@@ -2175,6 +2306,9 @@ def run_mainE():
                 print('  [corner] Case A: required capital at the maximal band '
                       'is below w^NS; residual incumbent NS capital forms an '
                       'atom at the top market; alpha2E = alpha1E')
+                print('  WARNING: the top-market rate adjustment for that residual '
+                      'atom (appendix Step 8, Case A corner) is not implemented; '
+                      'rnsE below is rtilde(alpha2) without it.')
                 g.alpha2E = g.alpha1E
             else:
                 # Bisection to find alpha2E
@@ -2245,51 +2379,65 @@ def run_mainE():
                 g.rnsE = rprime
 
     else:  # rtprime == min_r
-        # Find alpha2Eprime
-        res_c = minimize_scalar(
-            lambda al: ((1 + g.PiE) / gammaNSfunE(al) - 1 - _scalar(cfunE(al)) - g.PiE)**2,
-            bounds=(g.alpha1E, 1), method='bounded'
-        )
-        alc = res_c.x
-        if ((1 + g.PiE) / gammaNSfunE(alc) - 1 - _scalar(cfunE(alc)) - g.PiE)**2 < 0.001:
-            alpha2Ep = alc
-        else:
-            alpha2Ep = 1.0
+        # Step 7(c): skilled entrants extend the CIM region to the right.
+        # alpha_2^E is the smallest alpha > alpha_2 at which the entrant CIM
+        # rate K^E(alpha) reaches either non-selective candidate: the entrant
+        # break-even rate r''(alpha) or the incumbent capital-clearing rate
+        # r'(alpha) (the Step-7 expressions with alpha_2 -> alpha).  Bracketed
+        # roots on (alpha_2, 1]; alpha_2^E = 1 if neither is reached (no
+        # non-selective market operates).  Replaces a squared-residual
+        # minimisation over [alpha_1^E, 1] with a 0.001 tolerance.
+        def _r_breakeven(al):
+            return (1 + g.PiE) / gammaNSfunE(al) - 1
 
-        # Find alpha2Edoubleprime
-        res_c2 = minimize_scalar(
-            lambda al: (_scalar(dfuninv(
+        def _r_capclear(al):
+            return _scalar(dfuninv(
                 g.WNS / (g.badleftoverE +
-                         quad(gpriorfun_scalar, g.beta + al * (1 - g.beta), 1)[0])
-            )) - _scalar(cfunE(al)) - g.PiE)**2,
-            bounds=(g.alpha1E, 1), method='bounded'
-        )
-        alc2 = res_c2.x
-        val_c2 = _scalar(dfuninv(
-            g.WNS / (g.badleftoverE +
-                     quad(gpriorfun_scalar, g.beta + alc2 * (1 - g.beta), 1)[0])
-        ))
-        if (val_c2 - _scalar(cfunE(alc2)) - g.PiE)**2 < 0.001:
-            alpha2Edp = alc2
-        else:
-            alpha2Edp = 1.0
+                         quad(gpriorfun_scalar, g.beta + al * (1 - g.beta), 1)[0])))
 
-        g.alpha2E = min(alpha2Edp, alpha2Ep)
+        def _first_root(fn, lo, hi, n_scan=400):
+            xs = np.linspace(lo, hi, n_scan)
+            vals = np.array([fn(x) for x in xs])
+            for i in range(len(xs) - 1):
+                if vals[i] == 0.0:
+                    return float(xs[i])
+                if vals[i] * vals[i + 1] < 0:
+                    return brentq(fn, xs[i], xs[i + 1])
+            return None
+
+        lo_c, hi_c = g.alpha2 + 1e-6, 0.999
+        root_be = _first_root(lambda al: _scalar(cfunE(al)) + g.PiE - _r_breakeven(al), lo_c, hi_c)
+        root_cc = _first_root(lambda al: _scalar(cfunE(al)) + g.PiE - _r_capclear(al), lo_c, hi_c)
+        cands = [x for x in (root_be, root_cc) if x is not None]
+        g.alpha2E = min(cands) if cands else 1.0
         g.rnsE = _scalar(cfunE(g.alpha2E)) + g.PiE
 
         WNSE = max(0.0,
-                    _scalar(dfun(_scalar(cfunE(g.alpha2E)) + g.PiE)) *
+                    _scalar(dfun(g.rnsE)) *
                     (g.badleftoverE + quad(gpriorfun_scalar,
                                            g.beta + g.alpha2E * (1 - g.beta), 1)[0])
                     - g.WNS)
 
-        if WNSE > 0:
-            print('  >> CIM extended, with NS entry')
+        if not cands:
+            binding = 'neither candidate reached, alpha2E = 1'
+        elif root_be is not None and g.alpha2E == root_be:
+            binding = 'entrant break-even candidate binds'
         else:
-            print('  >> CIM extended, without NS entry')
+            binding = 'incumbent capital-clearing candidate binds'
+        print(f'  >> CIM extended ({binding}), ' +
+              ('with NS entry' if WNSE > 0 else 'without NS entry'))
 
     print(f"  alpha2E = {g.alpha2E:.6f}")
     print(f"  rnsE    = {g.rnsE:.6f}")
+    if g.alpha2E < g.alpha2 - 1e-9:
+        _phi0, _atom0 = _boundary_atom(g.alpha2E)
+        print(f"  Region IIb boundary: phi(alpha2E) = {_phi0:.6f}"
+              + (f", boundary NS atom = {_atom0:.6f}" if _atom0 > 1e-12
+                 else " (incumbent side binds: no boundary atom)"))
+        if g.alpha2E < g.alpha1 - 1e-9:
+            print("  WARNING: alpha2E < alpha1: the band reaches into the pooling "
+                  "region, where fifunE should use the pooling density instead of "
+                  "the Region-II slice density (not implemented).")
 
     # ---------- Cumulative wealth ----------
     cim_alphasE = np.linspace(g.alpha1E, g.alpha2E, 100)
@@ -2491,12 +2639,13 @@ def run_mainE():
             ax4.plot(0, 0, 'go', markersize=8,
                      markerfacecolor='white', markeredgewidth=2)
 
-        # Discrete: wmassE / Delta (convert mass to density)
+        # Entry mass per grid step -> density
+        _da_plot = getattr(g, 'entry_da', g.Delta)
         disc_alphas = almassE[:-1] if len(almassE) > 1 else almassE
-        disc_density = wmassE / g.Delta if g.Delta > 0 else wmassE
+        disc_density = wmassE / _da_plot if _da_plot > 0 else wmassE
         if len(disc_alphas) == len(disc_density):
             ax4.scatter(disc_alphas, disc_density, s=8, c='k', zorder=3,
-                        label='discrete $w^E/\\Delta$')
+                        label='entry mass / step')
         # Threshold lines (no legend labels)
         ax4.axvline(g.alpha0, color='red', ls=':', lw=0.8, alpha=0.5)
         ax4.axvline(g.alpha1, color='red', ls=':', lw=0.8, alpha=0.5)
@@ -2609,6 +2758,9 @@ def convergence_test(deltas=None):
     """
     if deltas is None:
         deltas = [0.004, 0.002, 0.001, 0.0005]
+
+    global USE_DISCRETE_REGION1
+    USE_DISCRETE_REGION1 = True   # this test is about the legacy discrete loop
 
     results = []
     ana_WE = None
@@ -2950,7 +3102,8 @@ def _ns_capital_entry(alpha_top):
     (α₂^E < α₂), Step 8 spreads the non-selective capital over the band
     [α₂^E, α₂] and the top market in the proportions the allocation φ fixes,
     and only the share φ(α₂) lands on top -- so the plain formula overstates
-    the atom (by 2.6% on the parallel-shift calibration, where φ(α₂)=0.897).
+    the atom; and when the entrant is the cheaper side at α₂^E a boundary
+    atom is lent at the band's first market (Step 8 boundary condition).
     The total in that case is exactly what _band_capital integrates, which is
     also the quantity the solver clears against w^NS when it pins α₂^E, so
     take it from there rather than re-deriving it.
@@ -3043,7 +3196,7 @@ def solve_for_config(name):
         # rtildeafunE come in), in addition to alpha0E/alpha1E/alpha2E.
         # Pass these as extra breakpoints so every discontinuity gets a gap.
         r_E_alphas, r_E_plot = _build_rate_curve_piecewise(
-            rfunE, max(g.alpha0E, g.alpha0), g.alpha1E, g.alpha2E,
+            rfunE, min(g.alpha0E, g.alpha0), g.alpha1E, g.alpha2E,
             extra_breakpoints=(g.alpha1, g.alpha2))
         # ω-axis version of the entrant rate.
         # The "top" α for the entrant is max(alpha2E, alpha2) — covers both the
@@ -3051,7 +3204,7 @@ def solve_for_config(name):
         alpha2_eff = max(g.alpha2E, g.alpha2)
         r_E_omegas, r_E_omega_rates = _build_omega_curve_from_alpha(
             r_E_alphas, r_E_plot, g.beta,
-            max(g.alpha0E, g.alpha0), g.rpE,
+            min(g.alpha0E, g.alpha0), g.rpE,
             alpha2_eff, g.rnsE)
         # Post-entry capital density.  In the pooling region the total is the
         # zero-profit density where entry is active and the (sunk) incumbent
@@ -3075,11 +3228,19 @@ def solve_for_config(name):
             # line at 0.370 while the green ran to 0.391.  The entrant closed
             # form needs no separate guard here: ironing has already zeroed
             # w^E wherever it approaches its own boundary.
-            K_inc_on_E = np.array([_scalar(cfun(a)) for a in ea['alphas']]) + g.Pi
+            # Incumbents below alpha_0^E (when entry starts above alpha_0) keep
+            # lending -- their capital is sunk -- at r_p^E; prepend their
+            # baseline density so the post-entry curve covers them too.
+            _pre = g.baseline_alphas_fine < ea['alphas'][0] - 1e-12
+            _al_all = np.concatenate([g.baseline_alphas_fine[_pre], ea['alphas']])
+            _w_all = np.concatenate([g.baseline_w_fine[_pre],
+                                     ea['w_incumbent'] + ea['wE']])
+            _wE_all = np.concatenate([np.zeros(int(_pre.sum())), ea['wE']])
+            K_inc_on_E = np.array([_scalar(cfun(a)) for a in _al_all]) + g.Pi
             w_pool_alphas, w_pool, _keep = _pooling_density_trim(
-                ea['alphas'], ea['w_incumbent'] + ea['wE'], g.rp, K_inc_on_E)
+                _al_all, _w_all, g.rp, K_inc_on_E)
             w_pool_alphas, w_pool = _break_at_entry_edges(
-                w_pool_alphas, w_pool, ea['wE'][_keep])
+                w_pool_alphas, w_pool, _wE_all[_keep])
         else:
             w_pool_alphas, w_pool, _ = _pooling_density_trim(
                 g.baseline_alphas_fine, g.baseline_w_fine, g.rp, K_pool_inc)
