@@ -1001,38 +1001,25 @@ def NSfunE(al):
 
 
 def rtildeafunE(al, al2):
-    """Tilde-r calculation for new entrants. Matches rtildeafunE.m"""
-    al2_scalar = _scalar(al2) if np.isscalar(al2) else _scalar(al2)
-
+    """Threat rate rtilde_R(al) anchored at the band boundary al2 (Step 7 of the
+    entry proof): gamma^{NS,E}(al) (1 + rtilde) = R with R = L(al2) =
+    gamma^{NS,E}(al2) (1 + r^E(al2)), r^E the prevailing selective rate
+    (min(rhat, K^E) up to alpha_2, K^E above).  Vectorised in al."""
+    al2_scalar = _scalar(al2)
     gNS_al2 = gammaNSfunE(al2_scalar)
     gNS_al = gammaNSfunE(al)
-
-    cost_al2 = min(_scalar(cfunE(al2_scalar)) + g.PiE, _scalar(cfun(al2_scalar)) + g.Pi)
-
-    return gNS_al2 / gNS_al * (1 + cost_al2) - 1
+    return gNS_al2 / gNS_al * (1 + _prevailing_rate(al2_scalar)) - 1
 
 
 def fifunE(al, al2):
-    """Fraction function for NS entry. Matches fifunE.m"""
+    """phi(al) = D(rhat(al)) / D(rtilde(al)): the share of its own slice that the
+    incumbent with precision al serves at the band rate (eq:phi-proof with the
+    incumbent density w = D(rhat) g (1-beta); rhat = K above alpha_1)."""
     al = np.atleast_1d(np.asarray(al, dtype=float))
-    wcimvec = wcim(al)
-
-    if len(al) == 1:
-        rt = _scalar(rtildeafunE(al[0], al2))
-        return _scalar(wcimvec) / (_scalar(dfun(rt)) * (1 - g.beta) *
-                                 _scalar(gpriorfun(g.beta + al[0] * (1 - g.beta))))
-    else:
-        fi = np.zeros(len(al))
-        rt0 = _scalar(rtildeafunE(al[0], al2))
-        fi[0] = wcimvec[0] / (_scalar(dfun(rt0)) *
-                               quad(gpriorfun_scalar, g.beta + al[0] * (1 - g.beta),
-                                    g.beta + al[1] * (1 - g.beta))[0])
-        for i in range(1, len(al)):
-            rt_i = _scalar(rtildeafunE(al[i], al2))
-            fi[i] = wcimvec[i] / (_scalar(dfun(rt_i)) *
-                                   quad(gpriorfun_scalar, g.beta + al[i-1] * (1 - g.beta),
-                                        g.beta + al[i] * (1 - g.beta))[0])
-        return fi
+    rt = np.atleast_1d(np.asarray(rtildeafunE(al, al2), dtype=float))
+    fi = np.array([_scalar(dfun(_incumbent_cim_rate(a))) / _scalar(dfun(r))
+                   for a, r in zip(al, rt)])
+    return _scalar(fi[0]) if len(al) == 1 else fi
 
 
 def _band_capital(al_start, n_pts=100):
@@ -1286,6 +1273,148 @@ def _boundary_atom(al_start):
     P0 = g.badleftoverE + quad(gpriorfun_scalar, g.beta + al_start * (1 - g.beta), 1)[0]
     atom0 = (1.0 - phi0) * P0 * _scalar(dfun(rtildeafunE(al_start, al_start)))
     return phi0, max(atom0, 0.0)
+
+
+# -----------------------------------------------------------------------------
+# Steps 7-8 of the entry proof: the non-selective margin as a fixed point in the
+# common non-selective revenue R (Appendix A.10, "Step 7: The non-selective
+# margin").  L(alpha) is the revenue a non-selective lender would earn at the
+# prevailing selective rate; N(R) = {L > R}; alpha_2^E(R) = inf N(R); C(R) the
+# non-selective capital the configuration absorbs; case (B) iff C(R_E) > w^NS.
+# -----------------------------------------------------------------------------
+
+def _pool_mass(al):
+    """P(alpha) = B^{NS,E} + G(1) - G(omega_g(alpha)): the leftover pool at market alpha."""
+    return g.badleftoverE + quad(gpriorfun_scalar, g.beta + _scalar(al) * (1 - g.beta), 1)[0]
+
+
+def _prevailing_rate(al):
+    """r^E(alpha): the rate at which market alpha clears with selective lenders
+    alone -- min(rhat, K^E) up to alpha_2 (eq:rEminKK), K^E above it."""
+    al = _scalar(al)
+    KE = _scalar(cfunE(al)) + g.PiE
+    if al <= g.alpha2 + 1e-12:
+        return min(_incumbent_cim_rate(al), KE)
+    return KE
+
+
+def _L_ns(al):
+    """L(alpha) = gamma^{NS,E}(alpha) (1 + r^E(alpha))  (eq:L-def)."""
+    return _scalar(gammaNSfunE(al)) * (1.0 + _prevailing_rate(al))
+
+
+def _ns_grid(n=1200):
+    """L on a grid over (alpha_1^E, 1), cached: L does not depend on R."""
+    key = (g.alpha1E, g.alpha2, g.badleftoverE, g.PiE, ACTIVE_CONFIG)
+    if getattr(g, '_ns_grid_key', None) != key:
+        grid = np.linspace(g.alpha1E + 1e-6, 1.0 - 1e-6, n)
+        L = np.array([_L_ns(a) for a in grid])
+        g._ns_grid_key, g._ns_grid_a, g._ns_grid_L = key, grid, L
+    return g._ns_grid_a, g._ns_grid_L
+
+
+def _ns_boundary(R):
+    """alpha_2^E(R) = inf{alpha in (alpha_1^E, 1] : L(alpha) > R}  (eq:NS-set);
+    refined by a bracketed root of L - R; 1.0 if the set is empty."""
+    grid, L = _ns_grid()
+    idx = np.where(L > R)[0]
+    if len(idx) == 0:
+        return 1.0
+    i = int(idx[0])
+    if i == 0:
+        return float(grid[0])
+    try:
+        return brentq(lambda a: _L_ns(a) - R, grid[i - 1], grid[i], xtol=1e-10)
+    except ValueError:
+        return float(grid[i])
+
+
+def _required_capital(R, n_pts=400):
+    """C(R) of eq:C-def: boundary atom + band density + top-market term when a
+    band opens below alpha_2; the top-market term alone otherwise."""
+    a2E = _ns_boundary(R)
+    if a2E >= 1.0 - 1e-9:
+        return 0.0
+    if a2E < g.alpha2 - 1e-9:
+        return _band_capital(a2E, n_pts=n_pts)
+    rt = R / _scalar(gammaNSfunE(a2E)) - 1.0
+    return _scalar(dfun(rt)) * _pool_mass(a2E)
+
+
+def _solve_ns_margin():
+    """Fixed point of Step 7.  Returns a dict with case, R, alpha2E, a_top, rnsE, WNSE
+    and diagnostics.  Raises RuntimeError in the rationed corner (w^NS below the
+    capital the peak of L on the extension needs), which no calibration may use."""
+    RE = 1.0 + g.PiE + _scalar(cfunE(0.0))
+    grid, L = _ns_grid()
+    k_star = int(np.argmax(L))
+    Lbar, a_star = float(L[k_star]), float(grid[k_star])
+    C_RE = _required_capital(RE)
+    if C_RE > g.WNS:
+        case, R, WNSE = 'B', RE, C_RE - g.WNS
+    else:
+        case, WNSE = 'A', 0.0
+        R_min = _scalar(gammaNSfunE(grid[0])) + 1e-6      # keeps every threat rate positive
+        R_hi, R_lo = RE, None
+        for k in range(1, 2000):
+            R_try = RE * (1.0 - 0.0025 * k)
+            if R_try <= R_min:
+                break
+            if _required_capital(R_try) > g.WNS:
+                R_lo = R_try
+                break
+            R_hi = R_try
+        if R_lo is None:
+            raise RuntimeError("Step 7: no revenue R with C(R) >= w^NS found above R_min")
+        R = brentq(lambda x: _required_capital(x) - g.WNS, R_lo, R_hi, xtol=1e-10)
+        resid = _required_capital(R) - g.WNS
+        if abs(resid) > 1e-3 * max(g.WNS, 1e-9):
+            # C jumps at R = Lbar when the top market sits on the extension and
+            # L is hump-shaped there: the rationed corner of the appendix.
+            C_Lbar = _pool_mass(a_star) * _scalar(dfun(_scalar(cfunE(a_star)) + g.PiE))
+            raise RuntimeError(
+                f"[rationed corner] C(R) does not reach w^NS = {g.WNS:.6f}: at the peak "
+                f"of L (alpha* = {a_star:.4f}, Lbar = {Lbar:.6f}) the top market needs "
+                f"{C_Lbar:.6f} of non-selective capital, shortfall {C_Lbar - g.WNS:.6f} "
+                f"({100 * (C_Lbar / g.WNS - 1):.1f}%). Recalibrate; the rationed regime "
+                f"is not implemented.")
+    a2E = _ns_boundary(R)
+    a_top = max(a2E, g.alpha2)
+    rnsE = R / _scalar(gammaNSfunE(a_top)) - 1.0
+    return dict(case=case, R=R, RE=RE, C_RE=C_RE, alpha2E=a2E, a_top=a_top,
+                rnsE=rnsE, WNSE=WNSE, Lbar=Lbar, a_star=a_star)
+
+
+def _maintained_checks(ns):
+    """Print the maintained conditions (M1)-(M7) of Appendix A.10 with their values."""
+    R = ns['R']
+    entry = g.rpE < g.rp
+    out = []
+    KE1 = _scalar(cfunE(g.alpha1)) + g.PiE
+    out.append(('M1', 'K^E(alpha1) - rpE >= 0', KE1 - g.rpE, (KE1 >= g.rpE - 1e-9) or not entry))
+    grid, _ = _ns_grid()
+    rE = np.array([_prevailing_rate(a) for a in grid])
+    out.append(('M2', 'min diff of r^E on (alpha1E,1]', float(np.min(np.diff(rE))), bool(np.min(np.diff(rE)) >= -1e-6)))
+    q0 = 1.0 / (1.0 + g.BperG)
+    out.append(('M3', 'R - q0(1+rpE)', R - q0 * (1 + g.rpE), q0 * (1 + g.rpE) <= R + 1e-12))
+    interior = (not entry) or (g.alpha0E > 0.005 + 1e-3 and g.alpha0E < g.alpha1 - 1e-3)
+    out.append(('M4', 'alpha0E interior', g.alpha0E if entry else float('nan'), interior))
+    ea = getattr(g, 'entry_analytical', None)
+    GEtop = float(ea['GE'][-1]) if ea is not None else 0.0
+    out.append(('M5', 'G^E(alpha1E) (unserved recognised goods)', GEtop, GEtop < 5e-3))
+    if entry and g.alpha0E > g.alpha0 + 1e-9:
+        al, G, B = _incumbent_only_pool(g.rpE)
+        m = al < g.alpha0E
+        rev = (G[m] / np.maximum(G[m] + B[m], 1e-300)) * (1 + g.rpE)
+        out.append(('M6', 'min incumbent revenue on [alpha0,alpha0E) - R', float(np.min(rev)) - R, bool(np.min(rev) >= R - 1e-9)))
+    else:
+        out.append(('M6', 'vacuous (alpha0E <= alpha0 or no entry)', float('nan'), True))
+    Rs = np.linspace(R, min(ns['RE'], 1.3 * R), 6)
+    Cs = np.array([_required_capital(x) for x in Rs])
+    out.append(('M7', 'C(R) nonincreasing on [R, min(R_E,1.3R)]', float(np.max(np.diff(Cs))), bool(np.max(np.diff(Cs)) <= 1e-9)))
+    for tag, desc, val, ok in out:
+        print(f"  [{tag}] {'ok  ' if ok else 'FAIL'} {desc}: {val:.6f}" if val == val else f"  [{tag}] {'ok  ' if ok else 'FAIL'} {desc}")
+    return all(ok for *_, ok in out)
 
 
 # =============================================================================
@@ -2273,159 +2402,36 @@ def run_mainE():
           f"{_leftover_bads_after_pooling(None, g.rp):.6f} vs badleftover "
           f"{g.badleftover:.6f})")
 
-    # ---------- Calculate non-selective and CIM ----------
-    print("  Computing non-selective and CIM regions...")
+    # ---------- Steps 7-8: the non-selective margin as a fixed point in R ----------
+    print("  Steps 7-8: non-selective margin (fixed point in the common revenue R)...")
 
-    rprime = _scalar(dfuninv(
-        g.WNS / (g.badleftoverE +
-                 quad(gpriorfun_scalar, g.beta + g.alpha2 * (1 - g.beta), 1)[0])
-    ))
-    rdprime = (1 + g.PiE) / gammaNSfunE(g.alpha2) - 1
+    # The three candidate rates at alpha_2 -- diagnostics only: the fixed point
+    # reduces to their comparison only when no band opens below alpha_2.
+    rprime = _scalar(dfuninv(g.WNS / _pool_mass(g.alpha2)))
+    rdprime = (1 + g.PiE + _scalar(cfunE(0.0))) / gammaNSfunE(g.alpha2) - 1
     rtprime = _scalar(cfunE(g.alpha2)) + g.PiE
-
-    min_r = min(rprime, rdprime, rtprime)
-    WNSE = 0.0
-
     print(f"  rprime   = {rprime:.6f}")
     print(f"  rdprime  = {rdprime:.6f}")
     print(f"  rtprime  = {rtprime:.6f}")
 
-    if rprime == min_r:
-        if rprime > _scalar(cfun(g.alpha2)) + g.Pi:
-            g.rnsE = rprime
-            g.alpha2E = g.alpha2
-            WNSE = 0.0
-            print('  >> rNS goes up, no NS entry')
-        else:
-            # Case A (Step 8): alpha2E pinned by capital clearing of the
-            # reallocated incumbent non-selective capital w^NS.
-            if _band_capital(g.alpha1E) < g.WNS:
-                # Corner (text Step 8, Case A): even the maximal band cannot
-                # absorb w^NS; the residual incumbent NS capital forms an atom
-                # at the top market.
-                print('  [corner] Case A: required capital at the maximal band '
-                      'is below w^NS; residual incumbent NS capital forms an '
-                      'atom at the top market; alpha2E = alpha1E')
-                print('  WARNING: the top-market rate adjustment for that residual '
-                      'atom (appendix Step 8, Case A corner) is not implemented; '
-                      'rnsE below is rtilde(alpha2) without it.')
-                g.alpha2E = g.alpha1E
-            else:
-                # Bisection to find alpha2E
-                err = 1.0
-                alpha_low = g.alpha1E
-                alpha_high = g.alpha2
-                alit = (alpha_low + alpha_high) / 2.0
-
-                while abs(err) > 0.0001:
-                    err = g.WNS - _band_capital(alit)
-
-                    if err > 0:
-                        alpha_high = alit
-                    else:
-                        alpha_low = alit
-
-                    alit = (alpha_low + alpha_high) / 2.0
-
-                g.alpha2E = alit
-            WNSE = 0.0
-            g.rnsE = _scalar(rtildeafunE(g.alpha2, g.alpha2E))
-            print('  >> NS rate goes down, no NS entry before alpha2, incumbents enter before')
-
-    elif rdprime == min_r:
-        if rdprime > _scalar(cfun(g.alpha2)) + g.Pi:
-            g.rnsE = rdprime
-            g.alpha2E = g.alpha2
-            print('  >> rNS goes up with NS entry')
-        else:
-            # Find alphaNSmax and alpha2E0
-            res_ns = minimize_scalar(
-                lambda al: -NSfunE(al),
-                bounds=(g.alpha1E, 1), method='bounded'
-            )
-            alphaNSmax = res_ns.x
-
-            if NSfunE(alphaNSmax) <= 0:
-                raise RuntimeError(
-                    "Case B (r''-min): NSfunE has no positive region on "
-                    "[alpha1E, 1], inconsistent with the branch hypothesis "
-                    "r'' < min(r''', r_NS); check the calibration.")
-            if NSfunE(g.alpha1E) > 0:
-                # Corner (text Step 8, Case B): the band extends to the lower
-                # boundary of the CIM region.
-                print('  [corner] NSfunE > 0 at alpha1E: Region IIb extends '
-                      'to the CIM lower boundary; alpha2E0 = alpha1E')
-                alpha2E0 = g.alpha1E
-            else:
-                # MATLAB uses fzero (bracket-based); use brentq for reliability
-                alpha2E0 = brentq(NSfunE, g.alpha1E, alphaNSmax)
-
-            # (The retired MATLAB line-210 rtildeafunE vector bug is patched
-            # inside _band_capital, which uses the scalar-alpha2 pattern.)
-            WNSE_val = _band_capital(alpha2E0, n_pts=1000)
-
-            if WNSE_val > g.WNS:
-                g.alpha2E = alpha2E0
-                g.rnsE = _scalar(rtildeafunE(g.alpha2, g.alpha2E))
-                WNSE = WNSE_val - g.WNS  # atom of entrant NS capital at rtilde(alpha2)
-                print('  >> NS rate goes down, with NS entry before alpha2')
-            else:
-                print('  >> WARNING: numerical-consistency failure: total band '
-                      'capital <= w^NS in Case B. The excess-capital lemma '
-                      '(Step 8 of the repaired proof) rules this out for '
-                      'monotone phi; investigate before trusting results. '
-                      'Falling back to alpha2E = alpha2, rnsE = rprime.')
-                g.alpha2E = g.alpha2
-                g.rnsE = rprime
-
-    else:  # rtprime == min_r
-        # Step 7(c): skilled entrants extend the CIM region to the right.
-        # alpha_2^E is the smallest alpha > alpha_2 at which the entrant CIM
-        # rate K^E(alpha) reaches either non-selective candidate: the entrant
-        # break-even rate r''(alpha) or the incumbent capital-clearing rate
-        # r'(alpha) (the Step-7 expressions with alpha_2 -> alpha).  Bracketed
-        # roots on (alpha_2, 1]; alpha_2^E = 1 if neither is reached (no
-        # non-selective market operates).  Replaces a squared-residual
-        # minimisation over [alpha_1^E, 1] with a 0.001 tolerance.
-        def _r_breakeven(al):
-            return (1 + g.PiE) / gammaNSfunE(al) - 1
-
-        def _r_capclear(al):
-            return _scalar(dfuninv(
-                g.WNS / (g.badleftoverE +
-                         quad(gpriorfun_scalar, g.beta + al * (1 - g.beta), 1)[0])))
-
-        def _first_root(fn, lo, hi, n_scan=400):
-            xs = np.linspace(lo, hi, n_scan)
-            vals = np.array([fn(x) for x in xs])
-            for i in range(len(xs) - 1):
-                if vals[i] == 0.0:
-                    return float(xs[i])
-                if vals[i] * vals[i + 1] < 0:
-                    return brentq(fn, xs[i], xs[i + 1])
-            return None
-
-        lo_c, hi_c = g.alpha2 + 1e-6, 0.999
-        root_be = _first_root(lambda al: _scalar(cfunE(al)) + g.PiE - _r_breakeven(al), lo_c, hi_c)
-        root_cc = _first_root(lambda al: _scalar(cfunE(al)) + g.PiE - _r_capclear(al), lo_c, hi_c)
-        cands = [x for x in (root_be, root_cc) if x is not None]
-        g.alpha2E = min(cands) if cands else 1.0
-        g.rnsE = _scalar(cfunE(g.alpha2E)) + g.PiE
-
-        WNSE = max(0.0,
-                    _scalar(dfun(g.rnsE)) *
-                    (g.badleftoverE + quad(gpriorfun_scalar,
-                                           g.beta + g.alpha2E * (1 - g.beta), 1)[0])
-                    - g.WNS)
-
-        if not cands:
-            binding = 'neither candidate reached, alpha2E = 1'
-        elif root_be is not None and g.alpha2E == root_be:
-            binding = 'entrant break-even candidate binds'
-        else:
-            binding = 'incumbent capital-clearing candidate binds'
-        print(f'  >> CIM extended ({binding}), ' +
-              ('with NS entry' if WNSE > 0 else 'without NS entry'))
+    ns = _solve_ns_margin()
+    g.alpha2E = ns['alpha2E']
+    g.rnsE = ns['rnsE']
+    g.R_ns = ns['R']
+    WNSE = ns['WNSE']
+    print(f"  case ({ns['case']}): R = {ns['R']:.6f}  (R_E = 1+K^E(0) = {ns['RE']:.6f}; "
+          f"C(R_E) = {ns['C_RE']:.6f} vs w^NS = {g.WNS:.6f}; "
+          f"max L on the grid = {ns['Lbar']:.6f} at alpha = {ns['a_star']:.4f})")
+    if g.alpha2E < g.alpha2 - 1e-9:
+        print(f"  >> Region IIb band [{g.alpha2E:.4f}, {g.alpha2:.4f}] opens; top market at alpha2; "
+              + ('entrant NS capital enters' if WNSE > 0 else 'no NS entry'))
+    elif g.alpha2E > g.alpha2 + 1e-9:
+        print(f"  >> Region II extended to alpha2E = {g.alpha2E:.4f}; top market there; "
+              + ('entrant NS capital enters' if WNSE > 0 else 'no NS entry'))
+    else:
+        print("  >> no band; top market at alpha2; "
+              + ('entrant NS capital enters' if WNSE > 0 else 'no NS entry'))
+    _maintained_checks(ns)
 
     print(f"  alpha2E = {g.alpha2E:.6f}")
     print(f"  rnsE    = {g.rnsE:.6f}")
