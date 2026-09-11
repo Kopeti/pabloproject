@@ -2940,10 +2940,26 @@ def _build_rate_curve_piecewise(rate_fn, alpha0, alpha1, alpha2,
         lo_v, hi_v = segs_r[i][-1], segs_r[i + 1][0]
         if (np.isfinite(lo_v) and np.isfinite(hi_v)
                 and abs(hi_v - lo_v) > jump_tol):
-            segs_a[i] = segs_a[i].copy()
-            segs_a[i + 1] = segs_a[i + 1].copy()
-            segs_a[i][-1] -= gap
-            segs_a[i + 1][0] += gap
+            # Open the gap by REMOVING the samples that fall inside it and
+            # re-inserting the endpoint at the gap's edge with the one-sided
+            # limit value.  Moving the endpoint alone (the previous version)
+            # pushed it past the next samples of a finely sampled segment and
+            # drew a small backward hook right after every jump.  A segment
+            # narrower than the gap (the Region-IIb sliver of figure 10a) gets
+            # a proportionally smaller gap so it is not swallowed.
+            a_l, r_l = segs_a[i], segs_r[i]
+            a_r, r_r = segs_a[i + 1], segs_r[i + 1]
+            g_i = min(gap, 0.25 * (a_l[-1] - a_l[0]), 0.25 * (a_r[-1] - a_r[0]))
+            if g_i <= 0:
+                continue
+            x_end = a_l[-1]
+            keep_l = a_l < x_end - g_i
+            segs_a[i] = np.append(a_l[keep_l], x_end - g_i)
+            segs_r[i] = np.append(r_l[keep_l], r_l[-1])
+            x_0 = a_r[0]
+            keep_r = a_r > x_0 + g_i
+            segs_a[i + 1] = np.concatenate([[x_0 + g_i], a_r[keep_r]])
+            segs_r[i + 1] = np.concatenate([[r_r[0]], r_r[keep_r]])
 
     nan = np.array([np.nan])
     alphas = np.concatenate([s for pair in zip(segs_a, [nan] * len(segs_a))
