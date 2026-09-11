@@ -13,15 +13,13 @@ cost advantage sits on the skill axis.
                borrowers in the band omega in [omega_b(alpha_0^E),
                omega_b(alpha_0)) that no incumbent accepts; badleftover falls
                and r_NS drops (4.018 -> 4.010).
-    10b (pool worsening): same dip form centered at alpha = 0.27 (mid-pool).
+    10b (pool worsening): same dip form centered at alpha = 0.27 (mid-pool),
+               depth 0.45 (0.68 until 2026-09-11; see the config comment).
                Entrants cream-skim good borrowers from the pooling segment;
-               badleftover rises (+0.043) and r_NS rises (4.018 -> 4.237).
-               Note the asymmetry: the worsening channel scales almost freely
-               with the dip (this calibration is near the monotonicity frontier
-               of K^E), while the improvement channel of 10a is structurally
-               capped near -0.007 (advantage below alpha_0 bounded by C(alpha)
-               since K^E(0)=K(0); gamma_0 gradient penalizes low-alpha entry;
-               Region-I absorption is anchored at alpha_1).
+               badleftover rises (+0.004) and r_NS rises (4.018 -> 4.035).
+               The dip cannot be made much deeper: past 0.45 the pooling rate
+               falls so far that the incumbents below the marginal entrant
+               would rather lend non-selectively (maintained condition M6).
 
 Produces, in the paper figures folder (same place as fig9a/fig9b):
     fig_panels_fig10a.png   the four panels of 10a as a 2x2 grid
@@ -63,13 +61,18 @@ m.PARAM_CONFIGS['FIG10a_pool_improve'] = {
 m.PARAM_CONFIGS['FIG10b_pool_worsen'] = {
     'description': 'Figure 10b - pool worsening: dip at mid-pool, PiE=Pi.',
     **_CUBIC_BASELINE,
-    # Advantage band (0.159, 0.381) inside (alpha_0, alpha_1) = (0.140, 0.394),
-    # max 0.237 at alpha = 0.30; C(0) = 0 so K^E(0) = Pi exactly.  delta_dip =
-    # 0.68 is near the monotonicity frontier of K^E = Pi + C*m: the min slope
-    # on the left flank is +0.12 (at 0.70 it is +0.03; at 0.75 K^E dips).
-    # Outcome: badleftoverE 0.595 -> 0.638, r_NS 4.018 -> 4.237 (+0.219).
+    # Advantage band about (0.17, 0.37) inside (alpha_0, alpha_1) = (0.140,
+    # 0.394), max about 0.12 at alpha = 0.27; C(0) = 0 so K^E(0) = Pi exactly.
+    # delta_dip was 0.68 until 2026-09-11.  Under the fixed-point solver that
+    # calibration violates maintained condition M6: the pooling rate collapses
+    # to 1.09 and the incumbents below the marginal entrant (alpha in
+    # [0.14, 0.27)) would earn more by lending non-selectively.  M6 holds from
+    # delta_dip = 0.45 down (margin 0.009; 0.02 at 0.40), all checks M1-M7 pass.
+    # Outcome at 0.45: case (A), no band, no non-selective entry, r_p 1.293 ->
+    # 1.18, badleftoverE 0.595 -> 0.598, r_NS 4.018 -> 4.035 (+0.018; it was
+    # +0.034 under the non-equilibrium delta_dip = 0.68 solution).
     'cfunE_params': {'alpha_center': 0.27, 'sigma': 0.06,
-                     'delta_dip': 0.68, 'delta_baseline': 0.12},
+                     'delta_dip': 0.45, 'delta_baseline': 0.12},
 }
 
 

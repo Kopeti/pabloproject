@@ -95,31 +95,34 @@ PARAM_CONFIGS = {
         # figures 9a/9b only.)
         #
         # The entrant's cost is the plain scaled curve C^E = LAM*C with
-        # LAM = 0.5 -- no sigmoid window.  Then
+        # LAM = 0.75 -- no sigmoid window.  Then
         #     K^E - K = (PiE - Pi) - (1-LAM) C(alpha)
         # is smooth and strictly decreasing, so it crosses zero exactly once,
         # and the saving (1-LAM)C(alpha) grows with alpha on its own: the
-        # big-data story without an engineered transition.  Here the single
-        # crossing IS alpha_hat of the main text (K^E < K above it), whereas in
-        # the old sigmoid form the transition centre (0.55) and the crossing
-        # (0.47) were different points.
+        # big-data story without an engineered transition.  The single
+        # crossing IS alpha_hat of the main text (K^E < K above it).
         #
-        # PiE = 1.182 = Pi + (1-LAM)*C(0.4826) places the crossing at
-        # alpha_hat = 0.482, i.e. 41% into Region II -- the same relative
-        # position the old calibration had.
-        # Outcome: alpha2E = 0.685 > alpha2 (Region II extended to the right,
-        # no Region IIb), r_NS 4.018 -> 3.826, drop 0.19.  Same solver branch
-        # as before ("CIM extended, without NS entry"); the drop is about half
-        # the old 0.43 because the cubic baseline is far steeper at high alpha,
-        # so a given proportional saving buys a shorter extension.
+        # PiE = 0.7087 = Pi + (1-LAM)*C(0.4826) places the crossing at
+        # alpha_hat = 0.482, i.e. 41% into Region II.
+        #
+        # LAM was 0.5 (PiE = 1.182) until 2026-09-11.  Under the fixed-point
+        # solver that calibration is not an equilibrium: the non-selective
+        # revenue L(alpha) is hump-shaped on the extension and the incumbents'
+        # non-selective capital falls 8% short of clearing its peak market
+        # (rationed corner), and for every LAM below 0.75 non-selective lending
+        # at the pooling rate would pay more than the top market (maintained
+        # condition M3).  At LAM = 0.75 all checks M1-M7 pass.
+        # Outcome: case (A), Region II extended to alpha2E = 0.640, no Region
+        # IIb, no non-selective entry, r_NS 4.018 -> 3.946 (drop 0.07; it was
+        # 0.19 under the non-equilibrium LAM = 0.5 solution).
         'Pi': 0.235,
         'beta': 0.5,
         'BperG': 1.0,
         'cfun': _cubic_baseline_cost,
         'has_entry': True,
-        'PiE': 1.182,
+        'PiE': 0.7087,
         'cfunE_kind': 'polynomial',
-        'cfunE_params': {'coeffs': lambda alpha: 0.5 * _cubic_baseline_cost(alpha)},
+        'cfunE_params': {'coeffs': lambda alpha: 0.75 * _cubic_baseline_cost(alpha)},
     },
     'FIG9_OB_limited': {
         'description': 'Figure 9a / fig:OB left - Open Banking, limited adoption (cost advantage at low alpha).',
