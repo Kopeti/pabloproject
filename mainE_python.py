@@ -2941,25 +2941,32 @@ def _build_rate_curve_piecewise(rate_fn, alpha0, alpha1, alpha2,
         if (np.isfinite(lo_v) and np.isfinite(hi_v)
                 and abs(hi_v - lo_v) > jump_tol):
             # Open the gap by REMOVING the samples that fall inside it and
-            # re-inserting the endpoint at the gap's edge with the one-sided
-            # limit value.  Moving the endpoint alone (the previous version)
-            # pushed it past the next samples of a finely sampled segment and
-            # drew a small backward hook right after every jump.  A segment
-            # narrower than the gap (the Region-IIb sliver of figure 10a) gets
-            # a proportionally smaller gap so it is not swallowed.
+            # closing each segment with a sample AT the gap's edge whose rate
+            # is the segment's own value there (interpolated).  Moving the
+            # endpoint alone (an earlier version) pushed it past the next
+            # samples of a finely sampled segment and drew a small backward
+            # hook after every jump; re-inserting the one-sided LIMIT value at
+            # the shifted position (the next version) drew a vertical stroke
+            # from the limit up to the curve wherever the schedule is steep
+            # right after the jump -- e.g. K^E just above alpha_1, which climbs
+            # at ~8 per unit alpha.  A segment narrower than the gap (the
+            # Region-IIb sliver of figure 10a) gets a proportionally smaller
+            # gap so it is not swallowed.
             a_l, r_l = segs_a[i], segs_r[i]
             a_r, r_r = segs_a[i + 1], segs_r[i + 1]
             g_i = min(gap, 0.25 * (a_l[-1] - a_l[0]), 0.25 * (a_r[-1] - a_r[0]))
             if g_i <= 0:
                 continue
-            x_end = a_l[-1]
-            keep_l = a_l < x_end - g_i
-            segs_a[i] = np.append(a_l[keep_l], x_end - g_i)
-            segs_r[i] = np.append(r_l[keep_l], r_l[-1])
-            x_0 = a_r[0]
-            keep_r = a_r > x_0 + g_i
-            segs_a[i + 1] = np.concatenate([[x_0 + g_i], a_r[keep_r]])
-            segs_r[i + 1] = np.concatenate([[r_r[0]], r_r[keep_r]])
+            x_end = a_l[-1] - g_i
+            keep_l = a_l < x_end
+            ok_l = np.isfinite(r_l)
+            segs_a[i] = np.append(a_l[keep_l], x_end)
+            segs_r[i] = np.append(r_l[keep_l], np.interp(x_end, a_l[ok_l], r_l[ok_l]))
+            x_0 = a_r[0] + g_i
+            keep_r = a_r > x_0
+            ok_r = np.isfinite(r_r)
+            segs_a[i + 1] = np.concatenate([[x_0], a_r[keep_r]])
+            segs_r[i + 1] = np.concatenate([[np.interp(x_0, a_r[ok_r], r_r[ok_r])], r_r[keep_r]])
 
     nan = np.array([np.nan])
     alphas = np.concatenate([s for pair in zip(segs_a, [nan] * len(segs_a))
