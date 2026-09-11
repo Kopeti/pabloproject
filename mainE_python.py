@@ -2925,48 +2925,17 @@ def _build_rate_curve_piecewise(rate_fn, alpha0, alpha1, alpha2,
         r = rate_fn(a, alpha0, alpha1, alpha2)
         segs_a.append(a)
         segs_r.append(r)
-    # Sampling runs right up to each breakpoint so a CONTINUOUS join closes up
-    # exactly -- a gap there reads as a jump the model does not have (that was
-    # the false discontinuity on figure 10a's Region-IIb zoom).  But then at a
-    # GENUINE jump the two segment ends sit at the same alpha and the break is
-    # invisible.  So nudge only those two x-coordinates apart, keeping their y
-    # at the true one-sided limits: the gap is visible and no rate is misread.
-    finite = np.concatenate([r[np.isfinite(r)] for r in segs_r if np.any(np.isfinite(r))]) \
-        if any(np.any(np.isfinite(r)) for r in segs_r) else np.array([0.0, 1.0])
-    span = max(float(np.max(finite) - np.min(finite)), 1e-12)
-    jump_tol = 1e-3 * span
-    gap = 0.005                      # in alpha units, ~0.5% of the axis
-    for i in range(len(segs_r) - 1):
-        lo_v, hi_v = segs_r[i][-1], segs_r[i + 1][0]
-        if (np.isfinite(lo_v) and np.isfinite(hi_v)
-                and abs(hi_v - lo_v) > jump_tol):
-            # Open the gap by REMOVING the samples that fall inside it and
-            # closing each segment with a sample AT the gap's edge whose rate
-            # is the segment's own value there (interpolated).  Moving the
-            # endpoint alone (an earlier version) pushed it past the next
-            # samples of a finely sampled segment and drew a small backward
-            # hook after every jump; re-inserting the one-sided LIMIT value at
-            # the shifted position (the next version) drew a vertical stroke
-            # from the limit up to the curve wherever the schedule is steep
-            # right after the jump -- e.g. K^E just above alpha_1, which climbs
-            # at ~8 per unit alpha.  A segment narrower than the gap (the
-            # Region-IIb sliver of figure 10a) gets a proportionally smaller
-            # gap so it is not swallowed.
-            a_l, r_l = segs_a[i], segs_r[i]
-            a_r, r_r = segs_a[i + 1], segs_r[i + 1]
-            g_i = min(gap, 0.25 * (a_l[-1] - a_l[0]), 0.25 * (a_r[-1] - a_r[0]))
-            if g_i <= 0:
-                continue
-            x_end = a_l[-1] - g_i
-            keep_l = a_l < x_end
-            ok_l = np.isfinite(r_l)
-            segs_a[i] = np.append(a_l[keep_l], x_end)
-            segs_r[i] = np.append(r_l[keep_l], np.interp(x_end, a_l[ok_l], r_l[ok_l]))
-            x_0 = a_r[0] + g_i
-            keep_r = a_r > x_0
-            ok_r = np.isfinite(r_r)
-            segs_a[i + 1] = np.concatenate([[x_0], a_r[keep_r]])
-            segs_r[i + 1] = np.concatenate([[np.interp(x_0, a_r[ok_r], r_r[ok_r])], r_r[keep_r]])
+    # Sampling runs right up to each breakpoint, and nothing is done to the
+    # segment ends at a jump: the schedule is defined at every alpha, so both
+    # one-sided pieces are drawn all the way to the breakpoint and the NaN
+    # sentinel alone keeps them unconnected.  A genuine jump therefore shows
+    # as a step without a riser, as large as the jump is at the panel's scale;
+    # a continuous join closes up exactly.  Earlier versions opened a
+    # horizontal gap of 0.005 in alpha around each jump to make it stand out;
+    # every variant of that either drew a spurious stroke (a backward hook, or
+    # a vertical piece from the one-sided limit up to the curve where the
+    # schedule is steep, e.g. K^E just above alpha_1) or left an interval of
+    # alpha with no curve at all, which misreads as a hole in the schedule.
 
     nan = np.array([np.nan])
     alphas = np.concatenate([s for pair in zip(segs_a, [nan] * len(segs_a))
