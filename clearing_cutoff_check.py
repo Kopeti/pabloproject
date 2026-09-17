@@ -1,0 +1,179 @@
+"""Clearing cutoff in the post-entry pooling region: a read-only diagnostic.
+
+Background (Notes/Entry_equilibrium_proof_explained.tex, revision of Sept 2026).
+The entry construction of Steps 5-6 lets entrants follow their zero-profit path
+as far as it goes.  The incumbents above the last entrant then either run out
+of borrowers before alpha_1 (part of their capital is idle, and they would
+rather undercut the pooling rate) or leave a residual of recognizable borrowers
+at alpha_1 (and the top incumbent would rather raise her rate).  Equilibrium
+needs neither: entry must stop at the cutoff alpha* from which the incumbents'
+capital exhausts the acceptable pool exactly at alpha_1.
+
+For each appendix example this script
+  * solves the model with the existing solver (nothing in it is changed),
+  * walks the incumbent-only continuation of Step 6 from every candidate cutoff
+    WITHOUT clipping the pool at zero, and records where the pool is exhausted,
+  * locates alpha*, checks free entry above it, and
+  * re-solves the non-selective margin (Step 7) and the maintained conditions
+    with entry truncated at alpha*.
+
+It saves no figure and writes no file.  Usage:  python clearing_cutoff_check.py
+"""
+import contextlib
+import io
+import os
+
+os.environ.setdefault('MPLBACKEND', 'Agg')
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import matplotlib.figure
+import numpy as np
+from scipy.integrate import quad
+
+# The solver saves diagnostic figures as a side effect; switch that off here.
+plt.savefig = lambda *a, **k: None
+plt.show = lambda *a, **k: None
+matplotlib.figure.Figure.savefig = lambda *a, **k: None
+
+import mainE_python as m
+with contextlib.redirect_stdout(io.StringIO()):
+    import make_figure11      # registers FIG11_parallel_shift
+    import make_figure10ab    # registers FIG10a_pool_improve, FIG10b_pool_worsen
+
+EXAMPLES = [
+    ('FIG11_parallel_shift', 'parallel shift'),
+    ('FIG8_bigdata', 'big data (advantage at high alpha)'),
+    ('FIG10a_pool_improve', 'advantage at alpha = 0'),
+    ('FIG10b_pool_worsen', 'advantage at intermediate alpha'),
+]
+
+
+def continuation(i, GE, BE, w_inc, B0t, gt, bt, Greq, beta, D, da):
+    """Incumbent-only continuation of Step 6 from cutoff index i, not clipped.
+
+    Returns where the acceptable pool is first exhausted (index or None), the
+    residual pool at the top of the grid, the incumbent capital left idle above
+    the exhaustion point, the largest entrant margin gamma - (1+K^E)/(1+r_p^E)
+    on the stretch where an entrant could break even, and the (G, B) paths.
+    """
+    n = len(Greq)
+    G, B = GE[i], BE[i]
+    exhausted_at, idle, margin = None, 0.0, -np.inf
+    Gp, Bp = np.zeros(n), np.zeros(n)
+    for k in range(i + 1, n):
+        T = G + B
+        inflow = (1 - beta) * gt[k] * da
+        if exhausted_at is None:
+            th = w_inc[k] / (D * T) if T > 1e-15 else np.inf
+            if np.isfinite(th):
+                E = B / max(B0t[k], 1e-15)
+                G_new = (1 - th * da) * G + inflow
+                B_new = (1 - th * da) * B - beta * bt[k] * E * da
+            else:
+                G_new, B_new = -1.0, 0.0
+            if G_new < 0.0 or G_new + max(B_new, 0.0) <= 0.0:
+                exhausted_at = k
+                idle += max(w_inc[k] * da - D * (T + inflow), 0.0)
+                G, B = 0.0, 0.0
+            else:
+                G, B = G_new, max(B_new, 0.0)
+        else:
+            idle += max(w_inc[k] * da - D * inflow, 0.0)
+            G, B = 0.0, 0.0
+        Gp[k], Bp[k] = G, B
+        if exhausted_at is None and Greq[k] < 1.0:
+            T_k = G + B
+            margin = max(margin, (G / T_k if T_k > 1e-15 else 1.0) - Greq[k])
+    return dict(exhausted_at=exhausted_at, resid_G=G, resid_B=B, idle=idle,
+                margin=margin, G=Gp, B=Bp)
+
+
+def _margin_and_checks():
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        ns = m._solve_ns_margin()
+        ok = m._maintained_checks(ns)
+    fails = [ln.strip() for ln in buf.getvalue().splitlines()
+             if ln.strip().startswith('[M') and 'FAIL' in ln]
+    return ns, ok, fails
+
+
+def check(name, label):
+    with contextlib.redirect_stdout(io.StringIO()):
+        m.solve_for_config(name)
+    g = m.g
+    gam0_a1 = m._scalar(m.gam0(g.alpha1))
+    share = m._scalar(m.dfun(g.rpE)) / (2.0 * m._scalar(m.dfun(g.rp)))
+    print(f'\n=== {label}  [{name}]')
+    print(f'  alpha0={g.alpha0:.4f}  alpha1={g.alpha1:.4f}  r_p={g.rp:.4f}  r_p^E={g.rpE:.4f}  '
+          f'alpha0^E={g.alpha0E:.4f}')
+    print(f'  share of capital lent by a rationed incumbent near alpha1, D(r_p^E)/(2D(r_p)) = {share:.3f}; '
+          f'gamma_0(alpha1) = {gam0_a1:.3f}  ->  a rationed incumbent '
+          f'{"undercuts" if share < gam0_a1 else "stays"}')
+    ns0, ok0, fails0 = _margin_and_checks()
+    print(f'  Steps 5-6 as they stand: case {ns0["case"]}, R={ns0["R"]:.5f}, r_NS^E={ns0["rnsE"]:.5f}, '
+          f'B^NS,E={g.badleftoverE:.6f} (baseline {g.badleftover:.6f}), conditions ok={ok0} {fails0 or ""}')
+
+    ea = g.entry_analytical
+    if ea is None or not np.any(ea['wE'] > 0):
+        print('  no entrant capital in the pooling region: baseline exhaustion at alpha1, alpha* is void')
+        return
+    al, da, beta, rpE = ea['alphas'], ea['da'], g.beta, g.rpE
+    D = m._scalar(m.dfun(rpE))
+    og, ob = beta + al * (1 - beta), 1 - beta + al * beta
+    gt = np.array([m.gpriorfun_scalar(x) for x in og])
+    bt = np.array([m.bpriorfun_scalar(x) for x in ob])
+    B0t = np.array([quad(m.bpriorfun_scalar, x, 1)[0] for x in ob])
+    Greq = (1 + ea['KE']) / (1 + rpE)
+    args = (ea['GE'], ea['BE'], ea['w_incumbent'], B0t, gt, bt, Greq, beta, D, da)
+    act = np.where(ea['wE'] > 0)[0]
+    a1pp = al[np.where(ea['KE'] < rpE)[0][-1]]
+    WE = float(np.sum(ea['wE']) * da)
+    top = continuation(act[-1], *args)
+    print(f"  entrants active up to {al[act[-1]]:.4f} (alpha_1''^E = {a1pp:.4f}), pooling capital W^E={WE:.5f}")
+    if top['exhausted_at'] is None:
+        q = top['resid_G'] / max(top['resid_G'] + top['resid_B'], 1e-300)
+        KE1 = ea['KE'][-1]
+        print(f'  NO clearing cutoff: even with all admissible entry the pool is not exhausted at alpha1.')
+        print(f'    residual at alpha1: goods {top["resid_G"]:.5f}, bads {top["resid_B"]:.5f}, quality {q:.4f}')
+        print(f'    top pooling incumbent: stays {q * (1 + rpE):.4f}, follows the residual to the first '
+              f'market above at min(r_p, K^E(alpha1)) = {min(g.rp, KE1):.4f}: {q * (1 + min(g.rp, KE1)):.4f}')
+        return
+    print(f'  with that entry the pool is exhausted at {al[top["exhausted_at"]]:.4f} < alpha1; '
+          f'idle incumbent capital {top["idle"]:.5f}')
+
+    # single crossing: exhaustion flag along all cutoffs of the active range
+    flags = [continuation(i, *args)['exhausted_at'] is not None for i in act]
+    switches = int(np.sum(np.diff(np.array(flags, dtype=int)) != 0))
+    i_s = act[int(np.where(np.array(flags))[0][0]) - 1] if flags[0] is False else None
+    if i_s is None:
+        print('  every cutoff exhausts early: no clearing cutoff on the grid')
+        return
+    star = continuation(i_s, *args)
+    print(f'  clearing cutoff alpha* in [{al[i_s]:.4f}, {al[i_s + 1]:.4f}]  '
+          f'(exhaustion flag switches {switches} time(s) along the cutoffs);')
+    print(f'    residual at alpha1 {star["resid_G"] + star["resid_B"]:.5f} (one grid step of inflow is '
+          f'{(1 - beta) * gt[-1] * da:.5f}); largest entrant margin above alpha*: {star["margin"]:.1e} '
+          f'(grid tolerance {da:.1e})')
+    WE2 = float(np.sum(ea['wE'][:i_s + 1]) * da)
+    print(f'    entrant pooling capital {WE:.5f} -> {WE2:.5f} ({100 * (WE2 / WE - 1):+.1f}%)')
+
+    ea2 = {k: (v.copy() if isinstance(v, np.ndarray) else v) for k, v in ea.items()}
+    ea2['wE'][i_s + 1:] = 0.0
+    ea2['GE'][i_s + 1:] = star['G'][i_s + 1:]
+    ea2['BE'][i_s + 1:] = star['B'][i_s + 1:]
+    ea2['TE'] = ea2['GE'] + ea2['BE']
+    with contextlib.redirect_stdout(io.StringIO()):
+        g.badleftoverE = m._leftover_bads_after_pooling(ea2, rpE)
+    g.entry_analytical = ea2
+    ns1, ok1, fails1 = _margin_and_checks()
+    print(f'  with entry stopped at alpha*: case {ns1["case"]}, R={ns1["R"]:.5f}, r_NS^E={ns1["rnsE"]:.5f}, '
+          f'B^NS,E={g.badleftoverE:.6f}, conditions ok={ok1} {fails1 or ""}')
+    print(f'    change: R {ns1["R"] - ns0["R"]:+.1e}, r_NS^E {ns1["rnsE"] - ns0["rnsE"]:+.1e}, '
+          f'alpha_2^E {ns1["alpha2E"] - ns0["alpha2E"]:+.1e}')
+
+
+if __name__ == '__main__':
+    for cfg, lab in EXAMPLES:
+        check(cfg, lab)
