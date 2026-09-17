@@ -158,8 +158,36 @@ def check(name, label, n_grid):
         print(f'    top pooling incumbent: stays {q * (1 + rpE):.4f}, follows the residual to the first '
               f'market above at min(r_p, K^E(alpha1)) = {min(g.rp, KE1):.4f}: {q * (1 + min(g.rp, KE1)):.4f}')
         return
-    print(f'  with that entry the pool is exhausted at {al[top["exhausted_at"]]:.4f} < alpha1; '
+    x_full = al[top["exhausted_at"]]
+    print(f'  with that entry the pool is exhausted at {x_full:.4f} < alpha1; '
           f'idle incumbent capital {top["idle"]:.5f}')
+
+    # Regularity condition (M5) of the note.
+    # (a) On [alpha_1''^E, alpha_1) the incumbents hold more capital than their
+    #     own slices absorb at the pooling rate: D(r_p^E)(1-beta)g(omega_g)/w < 1.
+    top_mask = (al >= a1pp) & (al < g.alpha1 - 5e-4)
+    lent = D * (1 - beta) * gt[top_mask] / np.maximum(ea['w_incumbent'][top_mask], 1e-300)
+    print(f"  (M5a) share of incumbent capital that own slices absorb on [alpha_1''^E, alpha_1): "
+          f'{lent.min():.3f} to {lent.max():.3f}  ->  {"ok" if lent.max() < 1 else "FAIL"}')
+    # (b) If the path of Steps 5-6 ends with a no-entry interval, the entrants'
+    #     density is positive at its left edge.  (The solver switches the closed
+    #     form off where r_p^E - K^E < 0.005; an interval that starts there is
+    #     not a no-entry interval of the construction.)
+    i_last = act[-1]
+    if rpE - ea['KE'][i_last] < 0.006:
+        print('  (M5b) entrants are active up to the end of the path: nothing to check')
+    else:
+        print(f'  (M5b) the path ends with a no-entry interval from {al[i_last]:.5f}; entrant density at its '
+              f'left edge {ea["wE"][i_last]:.2f} against incumbent density {ea["w_incumbent"][i_last]:.2f}  ->  '
+              f'{"ok" if ea["wE"][i_last] > 0 else "FAIL"}')
+    # What the incumbents above the exhaustion point would do on the full path.
+    rat = (al >= x_full) & (al < g.alpha1 - 5e-4)
+    share_r = D * (1 - beta) * gt[rat] / np.maximum(ea['w_incumbent'][rat], 1e-300)
+    gam0_r = np.array([m._scalar(m.gam0(a)) for a in al[rat][::max(1, rat.sum() // 50)]])
+    print(f'  on the full path the incumbents on [{x_full:.4f}, alpha_1) lend a share {share_r.min():.2f} to '
+          f'{share_r.max():.2f} of their capital: staying pays {share_r.min() * (1 + rpE):.2f} to '
+          f'{share_r.max() * (1 + rpE):.2f}, undercutting {gam0_r.min() * (1 + rpE):.2f} to '
+          f'{gam0_r.max() * (1 + rpE):.2f}, non-selective lending R = {ns0["R"]:.3f}')
 
     # The exhaustion flag is monotone in the cutoff (comparison lemma): check
     # that on a sample of cutoffs, then locate the switch by bisection.
