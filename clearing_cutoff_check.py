@@ -163,21 +163,25 @@ def check(name, label, n_grid):
           f'idle incumbent capital {top["idle"]:.5f}')
 
     # Regularity condition (M5) of the note.
-    # (a) On [alpha_1''^E, alpha_1) the incumbents hold more capital than their
+    # (a) K^E is strictly increasing at alpha_1''^E.
+    k1pp = int(np.where(ea['KE'] < rpE)[0][-1])
+    print(f"  (M5a) (K^E)'(alpha_1''^E) = {ea['KE_prime'][k1pp]:.3f}  ->  "
+          f"{'ok' if ea['KE_prime'][k1pp] > 0 else 'FAIL'}")
+    # (b) On [alpha_1''^E, alpha_1) the incumbents hold more capital than their
     #     own slices absorb at the pooling rate: D(r_p^E)(1-beta)g(omega_g)/w < 1.
     top_mask = (al >= a1pp) & (al < g.alpha1 - 5e-4)
     lent = D * (1 - beta) * gt[top_mask] / np.maximum(ea['w_incumbent'][top_mask], 1e-300)
-    print(f"  (M5a) share of incumbent capital that own slices absorb on [alpha_1''^E, alpha_1): "
+    print(f"  (M5b) share of incumbent capital that own slices absorb on [alpha_1''^E, alpha_1): "
           f'{lent.min():.3f} to {lent.max():.3f}  ->  {"ok" if lent.max() < 1 else "FAIL"}')
-    # (b) If the path of Steps 5-6 ends with a no-entry interval, the entrants'
+    # (c) If the path of Steps 5-6 ends with a no-entry interval, the entrants'
     #     density is positive at its left edge.  (The solver switches the closed
     #     form off where r_p^E - K^E < 0.005; an interval that starts there is
     #     not a no-entry interval of the construction.)
     i_last = act[-1]
     if rpE - ea['KE'][i_last] < 0.006:
-        print('  (M5b) entrants are active up to the end of the path: nothing to check')
+        print('  (M5c) entrants are active up to the end of the path: nothing to check')
     else:
-        print(f'  (M5b) the path ends with a no-entry interval from {al[i_last]:.5f}; entrant density at its '
+        print(f'  (M5c) the path ends with a no-entry interval from {al[i_last]:.5f}; entrant density at its '
               f'left edge {ea["wE"][i_last]:.2f} against incumbent density {ea["w_incumbent"][i_last]:.2f}  ->  '
               f'{"ok" if ea["wE"][i_last] > 0 else "FAIL"}')
     # What the incumbents above the exhaustion point would do on the full path.
