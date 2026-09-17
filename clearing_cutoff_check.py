@@ -17,7 +17,17 @@ For each appendix example this script
   * re-solves the non-selective margin (Step 7) and the maintained conditions
     with entry truncated at alpha*.
 
-It saves no figure and writes no file.  Usage:  python clearing_cutoff_check.py
+It saves no figure and writes no file.
+
+Usage:  python clearing_cutoff_check.py [--n GRID]
+
+GRID is the number of points of the pooling-region grid on which Steps 5-6 are
+re-solved here (default 16000; the solver's own default is 500).  The fine grid
+matters: where entry is concentrated on a very narrow interval, as in the
+'advantage at alpha = 0' example (entrant density about 30), one cell of the
+500-point grid carries eight times the capital that separates 'a residual is
+left' from 'the pool is exhausted early', and the coarse grid wrongly reports
+that no clearing cutoff exists.
 """
 import contextlib
 import io
@@ -99,10 +109,18 @@ def _margin_and_checks():
     return ns, ok, fails
 
 
-def check(name, label):
+def check(name, label, n_grid):
     with contextlib.redirect_stdout(io.StringIO()):
         m.solve_for_config(name)
     g = m.g
+    if g.entry_analytical is not None and n_grid:
+        # re-solve Steps 5-6 on the fine grid; everything downstream uses it
+        with contextlib.redirect_stdout(io.StringIO()):
+            ea_fine = m.solve_entry_pooling_analytical(
+                g.rpE, g.alpha0E, g.alpha1E, n_pts=n_grid,
+                cfunE_poly_info=getattr(g, 'cfunE_poly_info', None))
+            g.entry_analytical = ea_fine
+            g.badleftoverE = m._leftover_bads_after_pooling(ea_fine, g.rpE)
     gam0_a1 = m._scalar(m.gam0(g.alpha1))
     share = m._scalar(m.dfun(g.rpE)) / (2.0 * m._scalar(m.dfun(g.rp)))
     print(f'\n=== {label}  [{name}]')
@@ -131,7 +149,7 @@ def check(name, label):
     a1pp = al[np.where(ea['KE'] < rpE)[0][-1]]
     WE = float(np.sum(ea['wE']) * da)
     top = continuation(act[-1], *args)
-    print(f"  entrants active up to {al[act[-1]]:.4f} (alpha_1''^E = {a1pp:.4f}), pooling capital W^E={WE:.5f}")
+    print(f"  entrants active on [{al[act[0]]:.5f}, {al[act[-1]]:.5f}] (alpha_1''^E = {a1pp:.4f}), pooling capital W^E={WE:.5f}")
     if top['exhausted_at'] is None:
         q = top['resid_G'] / max(top['resid_G'] + top['resid_B'], 1e-300)
         KE1 = ea['KE'][-1]
@@ -143,16 +161,25 @@ def check(name, label):
     print(f'  with that entry the pool is exhausted at {al[top["exhausted_at"]]:.4f} < alpha1; '
           f'idle incumbent capital {top["idle"]:.5f}')
 
-    # single crossing: exhaustion flag along all cutoffs of the active range
-    flags = [continuation(i, *args)['exhausted_at'] is not None for i in act]
+    # The exhaustion flag is monotone in the cutoff (comparison lemma): check
+    # that on a sample of cutoffs, then locate the switch by bisection.
+    sample = act[np.unique(np.linspace(0, len(act) - 1, min(len(act), 60)).astype(int))]
+    flags = [continuation(i, *args)['exhausted_at'] is not None for i in sample]
     switches = int(np.sum(np.diff(np.array(flags, dtype=int)) != 0))
-    i_s = act[int(np.where(np.array(flags))[0][0]) - 1] if flags[0] is False else None
-    if i_s is None:
+    if flags[0]:
         print('  every cutoff exhausts early: no clearing cutoff on the grid')
         return
+    lo, hi = 0, len(act) - 1            # act[lo] does not exhaust early, act[hi] does
+    while hi - lo > 1:
+        mid = (lo + hi) // 2
+        if continuation(act[mid], *args)['exhausted_at'] is None:
+            lo = mid
+        else:
+            hi = mid
+    i_s = act[lo]
     star = continuation(i_s, *args)
-    print(f'  clearing cutoff alpha* in [{al[i_s]:.4f}, {al[i_s + 1]:.4f}]  '
-          f'(exhaustion flag switches {switches} time(s) along the cutoffs);')
+    print(f'  clearing cutoff alpha* in [{al[i_s]:.5f}, {al[i_s + 1]:.5f}]  '
+          f'(exhaustion flag switches {switches} time(s) on a sample of {len(sample)} cutoffs);')
     print(f'    residual at alpha1 {star["resid_G"] + star["resid_B"]:.5f} (one grid step of inflow is '
           f'{(1 - beta) * gt[-1] * da:.5f}); largest entrant margin above alpha*: {star["margin"]:.1e} '
           f'(grid tolerance {da:.1e})')
@@ -175,5 +202,10 @@ def check(name, label):
 
 
 if __name__ == '__main__':
+    import sys
+    n_grid = 16000
+    if '--n' in sys.argv:
+        n_grid = int(sys.argv[sys.argv.index('--n') + 1])
+    print(f'pooling-region grid: {n_grid} points')
     for cfg, lab in EXAMPLES:
-        check(cfg, lab)
+        check(cfg, lab, n_grid)
