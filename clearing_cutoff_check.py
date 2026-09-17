@@ -22,12 +22,23 @@ It saves no figure and writes no file.
 Usage:  python clearing_cutoff_check.py [--n GRID]
 
 GRID is the number of points of the pooling-region grid on which Steps 5-6 are
-re-solved here (default 16000; the solver's own default is 500).  The fine grid
+re-solved here (default 32000; the solver's own default is 500).  The fine grid
 matters: where entry is concentrated on a very narrow interval, as in the
 'advantage at alpha = 0' example (entrant density about 30), one cell of the
 500-point grid carries eight times the capital that separates 'a residual is
 left' from 'the pool is exhausted early', and the coarse grid wrongly reports
 that no clearing cutoff exists.
+
+The marginal entrant is located exactly here.  Step 2 of the proof defines
+alpha_0^E as the minimiser of the entrants' break-even rate.  Below alpha_0 the
+solver takes that minimum on a grid of 60 points (spacing 0.0024), which is
+wider than the whole interval on which entrants are active in the 'advantage
+at alpha = 0' example (0.0009).  r_p^E is hardly affected (the error is second
+order at a minimum), but the entrants' active range then starts at the wrong
+place, and with a density of 30 the capital lent on it, hence the leftover
+bads, is off by more than the effect the example is meant to show.  The patch
+below replaces the grid minimum by a bounded scalar minimisation, in memory
+only; pass --grid-a0E to switch it off and see the solver's own value.
 """
 import contextlib
 import io
@@ -40,6 +51,7 @@ import matplotlib.pyplot as plt
 import matplotlib.figure
 import numpy as np
 from scipy.integrate import quad
+from scipy.optimize import minimize_scalar
 
 # The solver saves diagnostic figures as a side effect; switch that off here.
 plt.savefig = lambda *a, **k: None
@@ -50,6 +62,32 @@ import mainE_python as m
 with contextlib.redirect_stdout(io.StringIO()):
     import make_figure11      # registers FIG11_parallel_shift
     import make_figure10ab    # registers FIG10a_pool_improve, FIG10b_pool_worsen
+
+_gap_on_grid = m._entry_breakeven_gap
+_low_min_cache = {}
+
+
+def _breakeven_low(a):
+    """Entrant's break-even rate on the fresh pool (no incumbent lends below alpha_0)."""
+    return (1.0 + m.g.PiE + m._scalar(m.cfunE(a))) / m._scalar(m.gam0(a)) - 1.0
+
+
+def _entry_breakeven_gap_exact(r):
+    """m._entry_breakeven_gap with the minimum below alpha_0 taken exactly."""
+    f, a = _gap_on_grid(r)
+    key = (m.ACTIVE_CONFIG, m.g.PiE, m.g.alpha0)
+    if key not in _low_min_cache:
+        al = m.g._al_low
+        be = np.array([_breakeven_low(x) for x in al])
+        k = int(np.argmin(be))
+        res = minimize_scalar(_breakeven_low, method='bounded', options={'xatol': 1e-12},
+                              bounds=(al[max(k - 1, 0)], al[min(k + 1, len(al) - 1)]))
+        _low_min_cache[key] = (float(res.fun), float(res.x)) if res.fun <= be[k] else (float(be[k]), float(al[k]))
+    be_min, a_min = _low_min_cache[key]
+    if be_min - r <= f + 1e-12:
+        return be_min - r, a_min
+    return f, a
+
 
 EXAMPLES = [
     ('FIG11_parallel_shift', 'parallel shift'),
@@ -227,17 +265,22 @@ def check(name, label, n_grid):
         g.badleftoverE = m._leftover_bads_after_pooling(ea2, rpE)
     g.entry_analytical = ea2
     ns1, ok1, fails1 = _margin_and_checks()
-    print(f'  with entry stopped at alpha*: case {ns1["case"]}, R={ns1["R"]:.5f}, r_NS^E={ns1["rnsE"]:.5f}, '
-          f'B^NS,E={g.badleftoverE:.6f}, conditions ok={ok1} {fails1 or ""}')
+    rns0 = m._scalar(m.cfun(g.alpha2)) + g.Pi
+    print(f'  with entry stopped at alpha*: case {ns1["case"]}, R={ns1["R"]:.5f}, r_NS^E={ns1["rnsE"]:.5f} '
+          f'(baseline {rns0:.5f}), B^NS,E={g.badleftoverE:.6f} (baseline {g.badleftover:.6f}), '
+          f'alpha_2^E={ns1["alpha2E"]:.4f} (alpha_2={g.alpha2:.4f}), conditions ok={ok1} {fails1 or ""}')
     print(f'    change: R {ns1["R"] - ns0["R"]:+.1e}, r_NS^E {ns1["rnsE"] - ns0["rnsE"]:+.1e}, '
           f'alpha_2^E {ns1["alpha2E"] - ns0["alpha2E"]:+.1e}')
 
 
 if __name__ == '__main__':
     import sys
-    n_grid = 16000
+    n_grid = 32000
     if '--n' in sys.argv:
         n_grid = int(sys.argv[sys.argv.index('--n') + 1])
-    print(f'pooling-region grid: {n_grid} points')
+    if '--grid-a0E' not in sys.argv:
+        m._entry_breakeven_gap = _entry_breakeven_gap_exact
+    print(f'pooling-region grid: {n_grid} points; marginal entrant below alpha_0 located '
+          f'{"on the 60-point grid of the solver" if "--grid-a0E" in sys.argv else "exactly"}')
     for cfg, lab in EXAMPLES:
         check(cfg, lab, n_grid)
