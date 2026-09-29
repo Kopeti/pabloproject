@@ -1413,36 +1413,146 @@ def _solve_ns_margin():
                 rnsE=rnsE, WNSE=WNSE, Lbar=Lbar, a_star=a_star)
 
 
-def _maintained_checks(ns):
-    """Print the maintained conditions (M1)-(M7) of Appendix A.10 with their values."""
-    R = ns['R']
-    entry = g.rpE < g.rp
-    out = []
-    KE1 = _scalar(cfunE(g.alpha1)) + g.PiE
-    out.append(('M1', 'K^E(alpha1) - rpE >= 0', KE1 - g.rpE, (KE1 >= g.rpE - 1e-9) or not entry))
-    grid, _ = _ns_grid()
-    rE = np.array([_prevailing_rate(a) for a in grid])
-    out.append(('M2', 'min diff of r^E on (alpha1E,1]', float(np.min(np.diff(rE))), bool(np.min(np.diff(rE)) >= -1e-6)))
-    q0 = 1.0 / (1.0 + g.BperG)
-    out.append(('M3', 'R - q0(1+rpE)', R - q0 * (1 + g.rpE), q0 * (1 + g.rpE) <= R + 1e-12))
-    interior = (not entry) or (g.alpha0E > 0.005 + 1e-3 and g.alpha0E < g.alpha1 - 1e-3)
-    out.append(('M4', 'alpha0E interior', g.alpha0E if entry else float('nan'), interior))
+def _rhat_closed_form(a, h=1e-5):
+    """Own-slice clearing rate of the baseline pooling incumbents at alpha.
+
+    From w^I = D(rhat) g(omega_g) (1-beta), with the pooling density
+    w = theta D(r_p) T written without the 0*inf of theta*T at alpha_1:
+    ln E = 2 ln(1-Gamma) + ln((1-beta) g~) - ln den,  den = Gamma' B0 -
+    beta b~ Gamma (1-Gamma), so that
+
+        w = D(r_p) (1-beta) g~ B0/den * [2 Gamma' - (1-Gamma) g~'/g~ + (1-Gamma) den'/den].
+
+    (g.rhat is held constant over the last points before alpha_1, where the
+    grid version of theta*T is unreliable; condition 1 of the verification
+    needs rhat up to alpha_1.)  At alpha_1 this gives D(rhat) = 2 D(r_p).
+    """
+    beta, rp = g.beta, g.rp
+    og, ob = beta + a * (1 - beta), 1 - beta + a * beta
+    Gm = (1 + _scalar(cfun(a)) + g.Pi) / (1 + rp)
+    Gp = _scalar(cfun_prime(a)) / (1 + rp)
+    Gpp = _scalar(cfun_prime2(a)) / (1 + rp)
+    gt, bt = gpriorfun_scalar(og), bpriorfun_scalar(ob)
+    gt_p = (1 - beta) * (gpriorfun_scalar(og + h) - gpriorfun_scalar(og - h)) / (2 * h)
+    bt_p = beta * (bpriorfun_scalar(ob + h) - bpriorfun_scalar(ob - h)) / (2 * h)
+    B0 = quad(bpriorfun_scalar, ob, 1)[0]
+    B0_p = -beta * bt
+    den = Gp * B0 - beta * bt * Gm * (1 - Gm)
+    den_p = Gpp * B0 + Gp * B0_p - beta * (bt_p * Gm * (1 - Gm) + bt * Gp * (1 - 2 * Gm))
+    w = (_scalar(dfun(rp)) * (1 - beta) * gt * B0 / den
+         * (2 * Gp - (1 - Gm) * gt_p / gt + (1 - Gm) * den_p / den))
+    return _scalar(dfuninv(w / ((1 - beta) * gt)))
+
+
+def _verification_checks(ns, n_grid=1500):
+    """Print the four conditions of the verification in Appendix A.10 and
+    whether the solution lies on the branches the construction covers.
+
+    Conditions (A.10, paragraph 'Verification'):
+      1. when alpha_1^E < alpha_1, rhat is nondecreasing on [alpha_1^E, alpha_1];
+      2. when 6(c) applies, it applies from alpha_2^E up to alpha_2, and
+         D(rhat)/D(r^NS) is nonincreasing there;
+      3. under 7(b): (a) gamma^NS(alpha)(1+r(alpha)) <= R for every alpha in
+         Region II; (b) q0 (1+r_p^E) <= R;
+      4. when alpha_0^E > alpha_0: gamma_0(alpha_0)(1+r_p^E) >= R.
+    alpha_1^E here is the point K^E = r_p^E; R is 1+K^E(0) under 7(c) and the
+    Region III revenue of the incumbents' non-selective capital under 7(b).
+
+    Branches outside the construction are reported, not solved differently:
+      * step 5(c) without a clearing cutoff (a residual is left at alpha_1);
+      * no non-selective entry (7(b)) with a band below alpha_2: the solver
+        then determines the band and the top market jointly as a fixed point
+        in R, which A.10 excludes (it is what condition 3(a) rules out).
+    Returns True iff all conditions hold and the solution is on a covered branch.
+    """
+    KE = lambda a: _scalar(cfunE(a)) + g.PiE
+    K = lambda a: _scalar(cfun(a)) + g.Pi
+    R, RE = ns['R'], ns['RE']
+    entry = g.rpE < g.rp - 1e-12
+    case5 = getattr(g, 'step5_case', None)
+    a1K = getattr(g, 'alpha1E_K', g.alpha1E)
+    ns_branch = '7(c)' if ns['case'] == 'B' else '7(b)'
+    a2E = ns['alpha2E']
+    band = a2E < g.alpha2 - 1e-9
+    out, notes = [], []
+
+    def rI(a):          # own-slice clearing rate of the Region II incumbents at Lambda = 1
+        return _rhat_closed_form(a) if a <= g.alpha1 else K(a)
+
+    # --- branches covered by the construction
     ea = getattr(g, 'entry_analytical', None)
-    GEtop = float(ea['GE'][-1]) if ea is not None else 0.0
-    out.append(('M5', 'G^E(alpha1E) (unserved recognised goods)', GEtop, GEtop < 5e-3))
-    if entry and g.alpha0E > g.alpha0 + 1e-9:
-        al, G, B = _incumbent_only_pool(g.rpE)
-        m = al < g.alpha0E
-        rev = (G[m] / np.maximum(G[m] + B[m], 1e-300)) * (1 + g.rpE)
-        out.append(('M6', 'min incumbent revenue on [alpha0,alpha0E) - R', float(np.min(rev)) - R, bool(np.min(rev) >= R - 1e-9)))
+    covered = True
+    if case5 == 'c' and (ea is None or ea.get('clearing_cutoff') is None):
+        covered = False
+        notes.append("OUTSIDE A.10: step 5(c) applies but there is no clearing cutoff "
+                     "(the incumbents leave a residual at alpha_1, or exhaust the pool early "
+                     "from every cutoff)")
+    if ns_branch == '7(b)' and band:
+        covered = False
+        notes.append(f"OUTSIDE A.10: band [{a2E:.4f}, {g.alpha2:.4f}] without non-selective "
+                     f"entry (case 7(b)): the non-selective incumbents lend in Region II at "
+                     f"R = {R:.5f} < 1+K^E(0) = {RE:.5f}, and band and top market are solved "
+                     f"jointly as a fixed point in R, which the construction does not cover")
+
+    # --- 1. rhat nondecreasing on [alpha_1^E, alpha_1]
+    if entry and a1K < g.alpha1:
+        al = np.linspace(a1K, g.alpha1 - 1e-7, n_grid)
+        rh = np.array([_rhat_closed_form(a) for a in al])
+        d = float(np.min(np.diff(rh)))
+        out.append(('V1', f'rhat nondecreasing on [alpha_1^E, alpha_1] = [{a1K:.4f}, {g.alpha1:.4f}] '
+                    f'({rh[0]:.4f} -> {rh[-1]:.4f}), min step', d, d >= -1e-10))
     else:
-        out.append(('M6', 'vacuous (alpha0E <= alpha0 or no entry)', float('nan'), True))
-    Rs = np.linspace(R, min(ns['RE'], 1.3 * R), 6)
-    Cs = np.array([_required_capital(x) for x in Rs])
-    out.append(('M7', 'C(R) nonincreasing on [R, min(R_E,1.3R)]', float(np.max(np.diff(Cs))), bool(np.max(np.diff(Cs)) <= 1e-9)))
+        out.append(('V1', 'vacuous (alpha_1^E >= alpha_1, or no entry in the pooling region)',
+                    float('nan'), True))
+
+    # --- 2. the band: 6(c) lowest up to alpha_2, Lambda nonincreasing
+    if band and ns_branch == '7(c)':
+        al = np.linspace(a2E + 1e-9, g.alpha2, n_grid)
+        rns = np.array([RE / _scalar(gammaNSfunE(a)) - 1.0 for a in al])
+        slack = float(np.max(rns - np.array([min(KE(a), rI(a)) for a in al])))
+        lam = np.array([_scalar(dfun(rI(a))) / _scalar(dfun(r)) for a, r in zip(al, rns)])
+        dl = float(np.max(np.diff(lam)))
+        # r^NS = K^E at alpha_2^E itself; the tolerance covers the root-finding there.
+        out.append(('V2a', f'6(c) lowest on [alpha_2^E, alpha_2] = [{a2E:.4f}, {g.alpha2:.4f}]: '
+                    f'max r^NS - min(K^E, r^I)', slack, slack <= 1e-6))
+        out.append(('V2b', f'Lambda = D(rhat)/D(r^NS) nonincreasing ({lam[0]:.4f} -> {lam[-1]:.4f}), '
+                    f'max step', dl, dl <= 1e-10))
+    elif band:
+        out.append(('V2', 'band under 7(b): not checked (outside A.10, see [branch] below)', float('nan'), False))
+    else:
+        out.append(('V2', 'vacuous (6(c) never the lowest rate in Region II)', float('nan'), True))
+
+    # --- 3. under 7(b): no market pays the non-selective incumbents more than Region III
+    q0 = quad(gpriorfun_scalar, 0, 1)[0] / (quad(gpriorfun_scalar, 0, 1)[0] + quad(bpriorfun_scalar, 0, 1)[0])
+    if ns_branch == '7(b)':
+        start2 = a1K if (entry and case5 in ('a', 'b')) else g.alpha1
+        al = np.linspace(start2 + 1e-7, ns['a_top'], n_grid)
+        Lrev = np.array([_scalar(gammaNSfunE(a)) * (1.0 + min(KE(a), rI(a))) for a in al])
+        k = int(np.argmax(Lrev))
+        out.append(('V3a', f'max over Region II of gamma^NS (1+r) - R (at alpha = {al[k]:.4f})',
+                    float(Lrev[k] - R), Lrev[k] <= R + 1e-9))
+        out.append(('V3b', 'q0 (1+r_p^E) - R', q0 * (1 + g.rpE) - R, q0 * (1 + g.rpE) <= R + 1e-12))
+    else:
+        out.append(('V3', f'vacuous under 7(c) (R = 1+K^E(0) = {RE:.5f}); q0 (1+r_p^E) - R',
+                    q0 * (1 + g.rpE) - R, True))
+
+    # --- 4. incumbents on [alpha_0, alpha_0^E) earn at least R
+    if entry and g.alpha0E > g.alpha0 + 1e-9:
+        v = _scalar(gam0(g.alpha0)) * (1 + g.rpE) - R
+        out.append(('V4', 'gamma_0(alpha_0) (1+r_p^E) - R', v, v >= -1e-12))
+    else:
+        out.append(('V4', 'vacuous (alpha_0^E <= alpha_0, or no entry in the pooling region)',
+                    float('nan'), True))
+
+    print(f"  Verification (A.10): step 5 case ({case5 or '-'}), Region III {ns_branch}, "
+          f"{'band from ' + format(a2E, '.4f') if band else 'no band'}")
     for tag, desc, val, ok in out:
-        print(f"  [{tag}] {'ok  ' if ok else 'FAIL'} {desc}: {val:.6f}" if val == val else f"  [{tag}] {'ok  ' if ok else 'FAIL'} {desc}")
-    return all(ok for *_, ok in out)
+        print(f"  [{tag}] {'ok  ' if ok else 'FAIL'} {desc}" + (f": {val:+.6f}" if val == val else ""))
+    for note in notes:
+        print(f"  [branch] {note}")
+    all_ok = covered and all(ok for *_, ok in out)
+    print(f"  Verification: {'all conditions hold, the construction is an equilibrium' if all_ok else 'NOT verified'}")
+    return all_ok
 
 
 # =============================================================================
@@ -2299,6 +2409,7 @@ def run_mainE():
     g.rhat = _rhat
 
     g.step5_case = None
+    g.alpha1E_K = alpha1Emin          # alpha_1^E of the proof: K^E = r_p^E
     if g.rpE < g.rp:
         # Step 5: where Region I ends.  alpha1Emin is alpha_1^E of the proof
         # (K^E = r_p^E).  (a) alpha_1^E >= alpha_1 and (b) rhat(alpha_1^E) >
@@ -2534,7 +2645,8 @@ def run_mainE():
     g.rnsE = ns['rnsE']
     g.R_ns = ns['R']
     WNSE = ns['WNSE']
-    print(f"  case ({ns['case']}): R = {ns['R']:.6f}  (R_E = 1+K^E(0) = {ns['RE']:.6f}; "
+    print(f"  case ({ns['case']}) = Region III {'7(c), non-selective entry' if ns['case'] == 'B' else '7(b), no non-selective entry'}: "
+          f"R = {ns['R']:.6f}  (R_E = 1+K^E(0) = {ns['RE']:.6f}; "
           f"C(R_E) = {ns['C_RE']:.6f} vs w^NS = {g.WNS:.6f}; "
           f"max L on the grid = {ns['Lbar']:.6f} at alpha = {ns['a_star']:.4f})")
     if g.alpha2E < g.alpha2 - 1e-9:
@@ -2546,7 +2658,7 @@ def run_mainE():
     else:
         print("  >> no band; top market at alpha2; "
               + ('entrant NS capital enters' if WNSE > 0 else 'no NS entry'))
-    _maintained_checks(ns)
+    g.verified = _verification_checks(ns)
 
     print(f"  alpha2E = {g.alpha2E:.6f}")
     print(f"  rnsE    = {g.rnsE:.6f}")

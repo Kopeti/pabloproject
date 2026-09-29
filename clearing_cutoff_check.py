@@ -146,9 +146,9 @@ def _margin_and_checks():
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
         ns = m._solve_ns_margin()
-        ok = m._maintained_checks(ns)
+        ok = m._verification_checks(ns)
     fails = [ln.strip() for ln in buf.getvalue().splitlines()
-             if ln.strip().startswith('[M') and 'FAIL' in ln]
+             if (ln.strip().startswith('[V') and 'FAIL' in ln) or ln.strip().startswith('[branch]')]
     return ns, ok, fails
 
 
@@ -267,6 +267,7 @@ def check(name, label, n_grid):
     ea2['GE'][i_s + 1:] = star['G'][i_s + 1:]
     ea2['BE'][i_s + 1:] = star['B'][i_s + 1:]
     ea2['TE'] = ea2['GE'] + ea2['BE']
+    ea2['clearing_cutoff'] = float(al[i_s])
     with contextlib.redirect_stdout(io.StringIO()):
         g.badleftoverE = m._leftover_bads_after_pooling(ea2, rpE)
     g.entry_analytical = ea2
