@@ -1216,12 +1216,37 @@ def _entry_breakeven_gap(r):
     valid[max(n - 3, 0):] = False
     gam = np.where(valid, G / np.maximum(T, 1e-300), np.nan)
     be = np.where(valid, (1.0 + g._KE_fine) / gam - 1.0, np.nan)
-    be_low = np.array([(1.0 + ke) / gam0(a) - 1.0
-                       for a, ke in zip(g._al_low, g._KE_low)])
-    al_all = np.concatenate([g._al_low, alphas])
-    be_all = np.concatenate([be_low, be])
-    k = int(np.nanargmin(be_all))
-    return be_all[k] - r, al_all[k]
+    be_low_min, al_low_min = _breakeven_low_min()
+    k = int(np.nanargmin(be))
+    if be_low_min <= be[k]:
+        return be_low_min - r, al_low_min
+    return be[k] - r, alphas[k]
+
+
+def _breakeven_low_min():
+    """Minimum of the entrants' break-even rate below alpha_0, located exactly.
+
+    Below alpha_0 no incumbent lends, so the entrant faces the fresh pool and
+    the break-even rate (1+K^E)/gam0 - 1 does not depend on the trial rate.
+    The 60-point grid g._al_low (spacing about 0.0024) only brackets the
+    minimum: where entry sits on a very narrow interval (the 'advantage at
+    alpha = 0' example, active range about 0.0009) the grid point misplaces
+    the start of entry by more than the effect the example shows.  The
+    minimum is refined by a bounded scalar search and cached per config.
+    """
+    key = (ACTIVE_CONFIG, g.PiE, g.alpha0)
+    if getattr(g, '_be_low_key', None) != key:
+        f = lambda a: (1.0 + g.PiE + _scalar(cfunE(a))) / _scalar(gam0(a)) - 1.0
+        al = g._al_low
+        be_low = np.array([(1.0 + ke) / _scalar(gam0(a)) - 1.0
+                           for a, ke in zip(al, g._KE_low)])
+        k = int(np.argmin(be_low))
+        res = minimize_scalar(f, method='bounded', options={'xatol': 1e-12},
+                              bounds=(al[max(k - 1, 0)], al[min(k + 1, len(al) - 1)]))
+        g._be_low = ((float(res.fun), float(res.x)) if res.fun <= be_low[k]
+                     else (float(be_low[k]), float(al[k])))
+        g._be_low_key = key
+    return g._be_low
 
 
 def _leftover_bads_after_pooling(ea, rpE):
@@ -1905,8 +1930,40 @@ def _iron_entry(alphas, GE, BE, EE, TE, gammaE, w_total, w_incumbent, KE,
             'diagnostics': diagnostics}
 
 
-def solve_entry_pooling_analytical(rpE, alpha0E, alpha1E, n_pts=500,
-                                   cfunE_poly_info=None):
+def _clearing_cutoff(GE, BE, w_incumbent, B0_tilde, g_tilde, b_tilde, beta,
+                     D_rpE, da, i):
+    """Walk the incumbent-only continuation from cutoff index i, not clipped.
+
+    Step 5(c) of the entry proof: after the last entrant at alphas[i] the
+    incumbents keep lending at r_p^E and the pool follows (Gprime
+    incumbents)-(theta incumbents).  Returns (exhausted_at, G_path, B_path):
+    the index where the acceptable pool is first exhausted (None if a
+    residual is left at the end of the grid) and the pool paths, indexed
+    like the grid (zero after exhaustion).
+    """
+    n = len(GE)
+    G, B = GE[i], BE[i]
+    G_path, B_path = np.zeros(n), np.zeros(n)
+    exhausted_at = None
+    for k in range(i + 1, n):
+        T = G + B
+        th = w_incumbent[k] / (D_rpE * T) if T > 1e-15 else np.inf
+        if np.isfinite(th):
+            E = B / max(B0_tilde[k], 1e-15)
+            G_new = (1 - th * da) * G + (1 - beta) * g_tilde[k] * da
+            B_new = (1 - th * da) * B - beta * b_tilde[k] * E * da
+        else:
+            G_new, B_new = -1.0, 0.0
+        if G_new < 0.0 or G_new + max(B_new, 0.0) <= 0.0:
+            exhausted_at = k
+            break
+        G, B = G_new, max(B_new, 0.0)
+        G_path[k], B_path[k] = G, B
+    return exhausted_at, G_path, B_path
+
+
+def solve_entry_pooling_analytical(rpE, alpha0E, alpha1E, n_pts=32000,
+                                   cfunE_poly_info=None, clearing_cutoff=True):
     """
     Analytical T^E construction for entry Region I (pooling).
 
@@ -1922,9 +1979,15 @@ def solve_entry_pooling_analytical(rpE, alpha0E, alpha1E, n_pts=500,
     rpE : float — entry pooling rate
     alpha0E : float — marginal entrant skill
     alpha1E : float — upper boundary of entry pooling region
-    n_pts : int — grid points (default 500)
+    n_pts : int — grid points (default 32000; where entry is concentrated on
+        a very narrow interval one cell of a 500-point grid carries more
+        capital than separates exhausting the pool early from leaving a
+        residual, so the clearing cutoff is misplaced or not found)
     cfunE_poly_info : dict or None — if provided, use smooth spline
         approximation (output of fit_cfunE_smooth) for KE and KE'.
+    clearing_cutoff : bool — in case (c) of Step 5 (g.step5_case == 'c')
+        stop entry at the clearing cutoff; False returns the path of Step 4
+        continued as far as entrants break even (diagnostics only).
 
     Returns
     -------
@@ -2052,6 +2115,45 @@ def solve_entry_pooling_analytical(rpE, alpha0E, alpha1E, n_pts=500,
                      f"{d_['state_mismatch_at_resume'][1]:.2e})"
                      if d_['state_mismatch_at_resume'] else ""))
 
+    # --- Step 5(c): the clearing cutoff --------------------------------------
+    # When alpha_1^E < alpha_1 and rhat(alpha_1^E) <= r_p^E, Region I runs to
+    # alpha_1 and entry stops at the smallest active cutoff from which the
+    # incumbents alone exhaust the pool exactly at alpha_1.  By the comparison
+    # lemma a later cutoff means a smaller pool above it, so "exhausted before
+    # the end of the grid" is monotone in the cutoff: locate the switch by
+    # bisection over the active points.
+    cutoff = None
+    if clearing_cutoff and getattr(g, 'step5_case', None) == 'c' and np.any(wE > 0):
+        act = np.where(wE > 0)[0]
+        cc_args = (GE, BE, w_incumbent, B0_tilde, g_tilde, b_tilde, beta, D_rpE, da)
+        if _clearing_cutoff(*cc_args, act[-1])[0] is None:
+            print("  WARNING Step 5(c): even with all admissible entry the pool is not "
+                  "exhausted at alpha_1 -- no clearing cutoff; outside the cases of A.10")
+        elif _clearing_cutoff(*cc_args, act[0])[0] is not None:
+            print("  WARNING Step 5(c): every cutoff exhausts the pool early -- no "
+                  "clearing cutoff on the grid")
+        else:
+            lo, hi = 0, len(act) - 1    # act[lo] leaves a residual, act[hi] exhausts early
+            while hi - lo > 1:
+                mid = (lo + hi) // 2
+                if _clearing_cutoff(*cc_args, act[mid])[0] is None:
+                    lo = mid
+                else:
+                    hi = mid
+            i_s = act[lo]
+            _, G_path, B_path = _clearing_cutoff(*cc_args, i_s)
+            WE_before = float(np.sum(wE) * da)
+            wE[i_s + 1:] = 0.0
+            GE[i_s + 1:] = G_path[i_s + 1:]
+            BE[i_s + 1:] = B_path[i_s + 1:]
+            TE[i_s + 1:] = GE[i_s + 1:] + BE[i_s + 1:]
+            EE[i_s + 1:] = BE[i_s + 1:] / np.maximum(B0_tilde[i_s + 1:], 1e-15)
+            gammaE[i_s + 1:] = np.where(TE[i_s + 1:] > 1e-15,
+                                        GE[i_s + 1:] / np.maximum(TE[i_s + 1:], 1e-300), 1.0)
+            cutoff = float(alphas[i_s])
+            print(f"  Step 5(c): clearing cutoff {cutoff:.5f}; entrant pooling capital "
+                  f"{WE_before:.5f} -> {float(np.sum(wE) * da):.5f}")
+
     # Cumulative entry capital
     WE_cumsum = np.zeros_like(alphas)
     WE_cumsum[1:] = np.cumsum(wE[:-1]) * da
@@ -2088,6 +2190,7 @@ def solve_entry_pooling_analytical(rpE, alpha0E, alpha1E, n_pts=500,
         'WE_cumsum': WE_cumsum,
         'suspended_intervals': suspended_intervals,
         'suspension_diags': suspension_diags,
+        'clearing_cutoff': cutoff,
     }
 
 
@@ -2172,9 +2275,8 @@ def run_mainE():
             f4 = lambda a: _scalar(cfunE(a)) - (g.rpE - g.PiE)
             alpha1Emin = g.alpha0E if f4(g.alpha0E) >= 0 else brentq(f4, g.alpha0E, 1.0)
         if alpha1Emin > g.alpha1 + 1e-9:
-            print(f"  WARNING: K^E(alpha1) < rpE (alpha1''^E = {alpha1Emin:.4f} > alpha1): "
-                  "entrants above alpha_1 undercut the pooling market -- outside the "
-                  "cases of Appendix A.10")
+            print(f"  K^E(alpha1) < rpE (alpha_1^E = {alpha1Emin:.4f} > alpha1): Step 5(a), "
+                  "the incumbents on (alpha_1, alpha_1^E) join the pooling market")
 
     # ---------- Step 3: cash-in-the-market rate rhat on the pooling grid ----------
     # rhat(alpha) solves w(alpha) = D(rhat) g(omega_g(alpha)) (1-beta) with the
@@ -2196,12 +2298,22 @@ def run_mainE():
     g.rhat_alphas = _al
     g.rhat = _rhat
 
+    g.step5_case = None
     if g.rpE < g.rp:
-        # alpha_1'^E: smallest alpha such that rhat >= rpE on [alpha, alpha_1]
-        _viol = np.where(_rhat < g.rpE)[0]
-        alpha1Ep = _al[min(_viol[-1] + 1, len(_al) - 1)] if len(_viol) else g.alpha0
-        g.alpha1E = max(alpha1Ep, alpha1Emin)
-        print(f"  alpha1'^E = {alpha1Ep:.6f}   alpha1''^E = {alpha1Emin:.6f}")
+        # Step 5: where Region I ends.  alpha1Emin is alpha_1^E of the proof
+        # (K^E = r_p^E).  (a) alpha_1^E >= alpha_1 and (b) rhat(alpha_1^E) >
+        # r_p^E: Region I ends at alpha_1^E.  (c) otherwise: Region I runs to
+        # alpha_1 and entry stops at the clearing cutoff, which
+        # solve_entry_pooling_analytical locates.
+        if alpha1Emin >= g.alpha1:
+            g.step5_case, g.alpha1E = 'a', alpha1Emin
+        elif float(np.interp(alpha1Emin, _al, _rhat)) > g.rpE:
+            g.step5_case, g.alpha1E = 'b', alpha1Emin
+        else:
+            g.step5_case, g.alpha1E = 'c', g.alpha1
+        print(f"  Step 5: alpha_1^E (K^E = r_p^E) = {alpha1Emin:.6f}, rhat there = "
+              f"{float(np.interp(alpha1Emin, _al, _rhat)):.4f} -> case ({g.step5_case}), "
+              f"Region I ends at {g.alpha1E:.6f}")
 
     print(f"  rpE = {g.rpE:.6f}")
     print(f"  alpha0E    = {g.alpha0E:.6f}")

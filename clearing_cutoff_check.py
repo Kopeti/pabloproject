@@ -38,7 +38,12 @@ order at a minimum), but the entrants' active range then starts at the wrong
 place, and with a density of 30 the capital lent on it, hence the leftover
 bads, is off by more than the effect the example is meant to show.  The patch
 below replaces the grid minimum by a bounded scalar minimisation, in memory
-only; pass --grid-a0E to switch it off and see the solver's own value.
+only; pass --grid-a0E to switch it off.
+
+Since 2026-09-29 the solver itself locates the marginal entrant exactly, uses
+the 32000-point grid and stops entry at the clearing cutoff (Step 5(c) of the
+proof).  This script re-solves Steps 4-5 with clearing_cutoff=False, so that
+it still sees the path before the cutoff and can locate the cutoff itself.
 """
 import contextlib
 import io
@@ -156,7 +161,8 @@ def check(name, label, n_grid):
         with contextlib.redirect_stdout(io.StringIO()):
             ea_fine = m.solve_entry_pooling_analytical(
                 g.rpE, g.alpha0E, g.alpha1E, n_pts=n_grid,
-                cfunE_poly_info=getattr(g, 'cfunE_poly_info', None))
+                cfunE_poly_info=getattr(g, 'cfunE_poly_info', None),
+                clearing_cutoff=False)
             g.entry_analytical = ea_fine
             g.badleftoverE = m._leftover_bads_after_pooling(ea_fine, g.rpE)
     gam0_a1 = m._scalar(m.gam0(g.alpha1))
